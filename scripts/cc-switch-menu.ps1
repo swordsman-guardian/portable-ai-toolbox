@@ -99,7 +99,7 @@ function Show-ToolboxCcSwitchMenu {
         if (-not $unifiedMode) {
             Write-Host '  9. 一次性迁移工具箱配置到 CC Switch'
             Write-Host ' 10. 核对迁移后，启用 CC Switch 唯一配置入口'
-        } else { Write-Host '配置已统一由 CC Switch 管理；CC About 更新请求已接入受控流程，Claude 实际安装和 USB 版本槽切换仍在验证。' }
+        } else { Write-Host '配置已统一由 CC Switch 管理；Claude 原生升级与 U 盘版本保存已通过验证，其他 harness 尚待验收。' }
         Write-Host '  0. 返回'
         $choice = Read-Host '请选择'
         if ($choice -eq '0' -or -not $choice) { return }

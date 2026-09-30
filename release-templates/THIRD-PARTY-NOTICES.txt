@@ -1,0 +1,24 @@
+Third-party components included in this private MVP distribution
+
+All bundled third-party components retain their own licenses and notices.
+This toolbox does not grant rights beyond those supplied by each component.
+
+Node.js / npm: runtime/node/LICENSE and bundled package LICENSE files
+  https://nodejs.org/ ; https://github.com/npm/cli
+Git for Windows: runtime/git/LICENSE.txt and bundled component notices
+  https://gitforwindows.org/
+Python / pip: runtime/python/LICENSE.txt and Lib/site-packages license files
+  https://www.python.org/ ; https://github.com/astral-sh/python-build-standalone
+uv: licenses/uv-LICENSE-APACHE and licenses/uv-LICENSE-MIT
+  https://github.com/astral-sh/uv
+CC Switch v3.20.4: licenses/CC-Switch-LICENSE; upstream official EXE unchanged
+  https://github.com/farion1231/cc-switch/tree/v3.20.4
+  Upstream source: https://github.com/farion1231/cc-switch/archive/refs/tags/v3.20.4.zip
+Claude Code 2.1.285: LICENSE files in tools/harness/claude/slots/2.1.285/node_modules
+  https://www.npmjs.com/package/@anthropic-ai/claude-code
+Microsoft Edge WebView2 Fixed Version Runtime: bundled component notices
+  https://developer.microsoft.com/microsoft-edge/webview2/
+  https://www.microsoft.com/en-us/legal/terms-of-use
+
+The native isolation adapter is toolbox source under scripts/; it is not a modified
+CC Switch executable. Software versions and hashes are recorded in release-manifest.json.

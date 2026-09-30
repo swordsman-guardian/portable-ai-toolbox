@@ -49,3 +49,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-cc-switch-harne
 ```
 
 部分集成测试需要 Windows 隔离能力、相应运行时或编译工具链。第三方软件从各自官方渠道获取，其许可证由各项目提供。
+
+## 预发布便携包
+
+首个完整包的版本说明与使用步骤见 [v0.1.0](docs/Release-v0.1.0.md)。源码仓库仍不存放运行时二进制；打包脚本仅从经过检查的依赖目录和空配置模板组装 Release。

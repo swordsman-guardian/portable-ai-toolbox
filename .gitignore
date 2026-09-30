@@ -139,3 +139,17 @@
 !/docs/CC-Switch便携原生升级器.md
 !/docs/CC-Switch下一阶段实施方案.md
 !/.gitleaks.toml
+!/scripts/build-release.ps1
+!/release-templates/
+/release-templates/*
+!/release-templates/README-FIRST.txt
+!/release-templates/THIRD-PARTY-NOTICES.txt
+!/release-templates/config/
+/release-templates/config/*
+!/release-templates/config/settings.json
+!/release-templates/licenses/
+/release-templates/licenses/*
+!/release-templates/licenses/CC-Switch-LICENSE
+!/release-templates/licenses/uv-LICENSE-APACHE
+!/release-templates/licenses/uv-LICENSE-MIT
+!/docs/Release-v0.1.0.md
