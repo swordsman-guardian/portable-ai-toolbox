@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+# Literal fake credential in an isolated migration regression test.
+# Both the path and exact value must match; do not exclude whole test trees.
+[[allowlists]]
+description = "Synthetic migration test value (not a real credential)"
+condition = "AND"
+paths = ['''(?:^|/)scripts/test-cc-switch-toolbox-migration\.ps1$''']
+regexTarget = "secret"
+regexes = ['''^sk-synthetic-secondary-55fd$''']

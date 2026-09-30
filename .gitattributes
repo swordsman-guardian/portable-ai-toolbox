@@ -1,0 +1,2 @@
+# Preserve exact source bytes (PowerShell BOM and verified source hashes).
+* -text

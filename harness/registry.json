@@ -1,0 +1,53 @@
+{
+  "_comment": "harness 适配层。加新 harness 只改这个文件，不改脚本。加之前必须先用 grep -a -o -c \"变量名\" <其二进制> 核实变量真实存在。",
+  "_fields": {
+    "id": "唯一标识",
+    "install": "如何安装到 npm-global/。npmOnFat32 说明该包在 FAT32 上要不要特殊处理",
+    "run": "启动方式。pathCandidates 按顺序试，取第一个存在且体积达标的（minBytes 用来排除 500 字节的报错存根）",
+    "copyToHost": "会话开始时要拷进主机 $S 的路径（相对盘根）。只放运行时必需的大件；不必需的留盘上引用即可，省拷贝时间",
+    "configDirEnv": "把配置/会话目录指向 $S 的环境变量名",
+    "providerEnv": "供应商配置注入用的环境变量名"
+  },
+  "harnesses": [
+    {
+      "id": "claude",
+      "name": "Claude Code",
+      "enabled": true,
+      "install": {
+        "type": "npm",
+        "package": "@anthropic-ai/claude-code",
+        "ignoreScripts": true,
+        "_why": "★ FAT32 上必须加 --ignore-scripts。该包的 postinstall 会把平台二进制用**硬链接**放到 bin/claude.exe，而 FAT32 不支持硬链接，报错：EISDIR: illegal operation on a directory, link '...claude-code-win32-x64\\claude.exe' -> '...\\bin\\claude.exe'。install.cjs 里虽然有 copyFileSync 兜底，但没捕获这个错误码。跳过 postinstall 后 bin/claude.exe 只剩一个 500 字节的报错存根，所以运行时要靠 pathCandidates 找到真正的平台二进制"
+      },
+      "run": {
+        "type": "exe",
+        "pathCandidates": [
+          "npm-global/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+          "npm-global/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-win32-x64/claude.exe"
+        ],
+        "minBytes": 1000000,
+        "_minBytesWhy": "第一个候选在 FAT32 上是个 500 字节的报错存根，同名同路径，只能靠体积区分"
+      },
+      "copyToHost": [
+        "npm-global/node_modules/@anthropic-ai/claude-code"
+      ],
+      "refFromUsb": [
+        "runtime/git",
+        "runtime/node"
+      ],
+      "configDirEnv": "CLAUDE_CONFIG_DIR",
+      "providerEnv": {
+        "baseUrl": "ANTHROPIC_BASE_URL",
+        "apiKey": "ANTHROPIC_AUTH_TOKEN",
+        "model": "ANTHROPIC_MODEL"
+      },
+      "extraArgs": ["--settings"],
+      "settingsFile": "config/claude/settings.json",
+      "env": {
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+      },
+      "notes": "原生单文件 exe（约 240MB），运行时不依赖 node。git 留盘上引用（约 385MB，拷进主机太慢），靠 CLAUDE_CODE_GIT_BASH_PATH 指到盘上的 bash"
+    }
+  ]
+}
