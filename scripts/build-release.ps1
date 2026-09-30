@@ -14,7 +14,9 @@ if ($StageOnly -and $ArchiveOnly) { throw 'StageOnly and ArchiveOnly are mutuall
 $source = [IO.Path]::GetFullPath($SourceRoot)
 if ($source -ne [IO.Path]::GetPathRoot($source)) { $source = $source.TrimEnd('\') }
 $sourcePrefix = $source.TrimEnd('\')+'\'
-$output = [IO.Path]::GetFullPath($OutputDirectory).TrimEnd('\')
+$output = [IO.Path]::GetFullPath($OutputDirectory)
+if ($output -eq [IO.Path]::GetPathRoot($output)) { throw 'Use a dedicated output subdirectory, not a drive root.' }
+$output = $output.TrimEnd('\')
 if ($output -eq $source.TrimEnd('\') -or $output.StartsWith($sourcePrefix,[StringComparison]::OrdinalIgnoreCase)) { throw 'Release output must be outside the source tree.' }
 $name = 'portable-ai-toolbox-v'+$Version+'-windows-x64'
 $stage = Join-Path $output $name
@@ -115,6 +117,7 @@ foreach ($entry in $manifest.files) {
 $actual = @(Get-PlainFiles $stage | Where-Object {$_.FullName -ine $manifestPath})
 if ($actual.Count -ne $expected.Count) { throw 'Unexpected staging files.' }
 foreach ($file in $actual) { if (-not $expected.Contains($file.FullName.Substring($stage.Length+1).Replace('\','/'))) { throw 'Unexpected staging path.' } }
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [IO.Compression.ZipFile]::Open($zipPath,[IO.Compression.ZipArchiveMode]::Create)
 try {
