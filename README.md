@@ -53,3 +53,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-cc-switch-harne
 ## 预发布便携包
 
 首个完整包的版本说明与使用步骤见 [v0.1.0](docs/Release-v0.1.0.md)。源码仓库仍不存放运行时二进制；打包脚本仅从经过检查的依赖目录和空配置模板组装 Release。
+
+### v0.1.0 启动解锁补丁
+
+首版在另一台电脑直接打开 AI.cmd 时可能提示缺少 secure session locator。Release 页面另附 startup-fix 小补丁，将其中 scripts 文件夹合并到工具箱根目录即可，保留现有配置和密码。修复后，交互启动会引导解锁；已有会话直接复用，非交互启动仍需预先解锁。

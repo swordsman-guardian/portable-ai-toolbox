@@ -153,3 +153,5 @@
 !/release-templates/licenses/uv-LICENSE-APACHE
 !/release-templates/licenses/uv-LICENSE-MIT
 !/docs/Release-v0.1.0.md
+!/scripts/cc-switch-startup.ps1
+!/scripts/test-cc-switch-startup.ps1

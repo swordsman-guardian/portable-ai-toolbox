@@ -504,6 +504,14 @@ Write-Log "工作目录（$targetWhy）: $target"
 $unifiedMode = Get-CcSwitchUnifiedMode -StickRoot $StickRoot
 $ccSwitchMode = $unifiedMode -or [bool]$userSettings.ccSwitchClaudeProvider
 $ccLaunchFiles = $null
+if ($unifiedMode -and $interactive) {
+    $startupInteractive = $false
+    try { $startupInteractive = -not [Console]::IsInputRedirected } catch { }
+    if ($startupInteractive) {
+        . (Join-Path $PSScriptRoot 'cc-switch-startup.ps1') -StickRoot $StickRoot
+        $null = Ensure-CcSwitchStartupSession -Root $StickRoot -Interactive $true
+    }
+}
 if ($ccSwitchMode) {
     if ($h.id -ne 'claude') { throw 'CC Switch 当前供应商模式仅支持 Claude Code。' }
     if ($unifiedMode) {
