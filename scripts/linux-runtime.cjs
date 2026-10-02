@@ -45,6 +45,38 @@ function digest(p) {
   const crypto = require('node:crypto');
   return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
 }
+function claudeScopeFingerprint(scopeDir) {
+  const crypto = require('node:crypto');
+  const entries = [];
+  const todo = [scopeDir];
+  while (todo.length) {
+    const dir = todo.pop();
+    const children = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const ent of children) {
+      const p = path.join(dir, ent.name); const rel = path.relative(scopeDir, p).split(path.sep).join('/');
+      const st = fs.lstatSync(p);
+      if (st.isSymbolicLink()) {
+        const target = fs.readlinkSync(p);
+        if (!inside(scopeDir, path.resolve(path.dirname(p), target))) throw new Error('Claude package scope contains a link outside its export tree');
+        entries.push({ path: rel, type: 'link', target });
+      } else if (st.isDirectory()) {
+        entries.push({ path: rel, type: 'directory' }); todo.push(p);
+      } else if (st.isFile()) {
+        entries.push({ path: rel, type: 'file', executable: st.mode & 0o111, size: st.size, sha256: digest(p) });
+      } else throw new Error('Claude package contains a special filesystem entry');
+    }
+  }
+  entries.sort((a, b) => a.path.localeCompare(b.path));
+  return crypto.createHash('sha256').update(JSON.stringify(entries)).digest('hex');
+}
+function claudeOriginPath(sessionRoot) {
+  // sessionRoot itself is never mounted into the guest. Only selected child
+  // paths are bound, and the writable npm child cannot reach this host file.
+  return path.join(sessionRoot, '.claude-origin.json');
+}
+function sameActive(a, b) {
+  return !!a && !!b && a.slot === b.slot && a.version === b.version && a.archiveSha256 === b.archiveSha256;
+}
 function status(root, options = {}) {
   root = rejectSymlinkPath(root);
   if (process.platform !== 'linux') throw new Error('Linux runtime requested on a non-Linux host');
@@ -214,6 +246,13 @@ function stageRuntime(root, sessionRoot) {
   const claudeBundle = resolveClaudeBundle(root);
   createFreshDir(npmPrefix);
   extract(claudeBundle.archive, npmPrefix, 'gz');
+  // The sandbox only binds selected child directories, including the
+  // guest-writable npm tree; this host-owned file stays outside those mounts.
+  const originPath = claudeOriginPath(sessionRoot);
+  rejectSymlinkPath(originPath, true);
+  const originScope = path.join(npmPrefix, 'lib/node_modules/@anthropic-ai');
+  const origin = { active: claudeBundle.active, scopeFingerprint: claudeScopeFingerprint(originScope) };
+  fs.writeFileSync(originPath, `${JSON.stringify(origin)}\n`, { flag: 'wx', mode: 0o600 });
   // AppImage is a read-only executable payload. Extract AppDir to the session;
   // do not depend on FUSE or execute the image from the removable volume.
   const appImage = path.join(rt, 'cc-switch.AppImage');
@@ -314,6 +353,23 @@ function exportClaudeRuntime(root, sessionRoot) {
   if (process.platform !== 'linux' || process.arch !== 'x64') throw new Error('Claude runtime export is Linux x64 only');
   const prefix = path.join(sessionRoot, 'npm');
   rejectSymlinkPath(prefix);
+  const npmRoot = path.join(root, 'npm-global/linux-x64');
+  ensureSafeDir(npmRoot);
+  const activePath = path.join(npmRoot, 'active.json');
+  rejectSymlinkPath(activePath, true);
+  const currentActive = regular(activePath) ? JSON.parse(fs.readFileSync(activePath, 'utf8')) : null;
+  const originPath = claudeOriginPath(sessionRoot);
+  rejectSymlinkPath(originPath, true);
+  let origin = null;
+  if (regular(originPath)) {
+    origin = JSON.parse(fs.readFileSync(originPath, 'utf8'));
+    if (!origin.active || typeof origin.scopeFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(origin.scopeFingerprint) ||
+        typeof origin.active.slot !== 'string' || !/^slots\/\d+\.\d+\.\d+-[0-9a-f]{12}$/.test(origin.active.slot) ||
+        !/^\d+\.\d+\.\d+$/.test(origin.active.version || '') || !/^[0-9a-f]{64}$/.test(origin.active.archiveSha256 || '')) {
+      throw new Error('Claude session origin metadata is invalid');
+    }
+    if (!sameActive(currentActive, origin.active)) throw new Error('refusing stale Claude runtime export: active package changed after this session was staged');
+  } else if (fs.existsSync(originPath)) throw new Error('Claude session origin metadata is not a plain file');
   const packageDir = path.join(prefix, 'lib/node_modules/@anthropic-ai/claude-code');
   const pkgPath = path.join(packageDir, 'package.json');
   rejectSymlinkPath(pkgPath);
@@ -344,6 +400,14 @@ function exportClaudeRuntime(root, sessionRoot) {
       else if (!st.isFile()) throw new Error('Claude package contains a special filesystem entry');
     }
   }
+  const currentFingerprint = claudeScopeFingerprint(scopeDir);
+  if (origin && currentFingerprint === origin.scopeFingerprint) {
+    // Revalidate the archive as well as the baseline pointer. This leaves its
+    // slot, active pointer bytes and pointer timestamp untouched on no-op exits.
+    const unchanged = resolveClaudeBundle(root);
+    if (!sameActive(unchanged.active, origin.active)) throw new Error('refusing stale Claude runtime export: active package changed after this session was staged');
+    return { ...unchanged.active, path: unchanged.slot, sha256: unchanged.active.archiveSha256, unchanged: true };
+  }
   const temp = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'aistick-claude-export-'));
   try {
     const content = path.join(temp, 'package'); fs.mkdirSync(content, { mode: 0o700 });
@@ -358,7 +422,6 @@ function exportClaudeRuntime(root, sessionRoot) {
     if (created.status !== 0) throw new Error(`Claude package archive failed: ${created.stderr}`);
     const archiveSha256 = digest(archive);
     const slot = `slots/${pkg.version}-${archiveSha256.slice(0, 12)}`;
-    const npmRoot = path.join(root, 'npm-global/linux-x64'); ensureSafeDir(npmRoot);
     const slotsRoot = path.join(npmRoot, 'slots'); ensureSafeDir(slotsRoot);
     const slotTarget = path.join(npmRoot, slot);
     if (!fs.existsSync(slotTarget)) {
@@ -390,7 +453,15 @@ function exportClaudeRuntime(root, sessionRoot) {
     if (savedManifest.name !== pkg.name || savedManifest.version !== pkg.version || savedManifest.archiveSha256 !== archiveSha256 ||
         (savedManifest.registryIntegrity !== null && !/^sha512-[A-Za-z0-9+/]+=*$/.test(savedManifest.registryIntegrity))) throw new Error('exported Claude slot metadata did not validate');
     const active = { slot, version: pkg.version, archiveSha256 };
-    const activePath = path.join(npmRoot, 'active.json'); const nextPath = `${activePath}.next-${process.pid}`;
+    // Another session may have completed an upgrade while this session was
+    // running. Check at publication time too, so stale package bytes cannot
+    // move the active pointer backwards.
+    if (origin) {
+      rejectSymlinkPath(activePath);
+      const latest = JSON.parse(fs.readFileSync(activePath, 'utf8'));
+      if (!sameActive(latest, origin.active)) throw new Error('refusing stale Claude runtime export: active package changed after this session was staged');
+    }
+    const nextPath = `${activePath}.next-${process.pid}`;
     fs.writeFileSync(nextPath, `${JSON.stringify(active, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
     fs.renameSync(nextPath, activePath);
     return { ...active, path: slotTarget, sha256: archiveSha256 };

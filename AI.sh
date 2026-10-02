@@ -3,6 +3,7 @@
 set -eu
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 export PATH
+unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH
 ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 if [[ ! -f "$ROOT/scripts/ai.cjs" ]]; then echo "Toolbox files are incomplete: $ROOT/scripts/ai.cjs is missing." >&2; exit 1; fi
 ARCHIVE="$ROOT/runtime/linux-x64/node-runtime.tar.xz"

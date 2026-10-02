@@ -69,6 +69,47 @@ function checkClaudeExport() {
     assert.doesNotMatch(listing.stdout, /(?:^|\/)bin\/(?:node|npm)(?:\n|$)/m);
     assert.doesNotMatch(listing.stdout, /private-settings|cache/);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'npm-global/linux-x64', active.slot, 'manifest.json'), 'utf8')).registryIntegrity, null);
+    const scope = path.join(prefix, 'lib/node_modules/@anthropic-ai');
+    const fingerprint = (base) => {
+      const entries = []; const todo = [base];
+      while (todo.length) {
+        const dir = todo.pop();
+        for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, ent.name); const rel = path.relative(base, p).split(path.sep).join('/'); const st = fs.lstatSync(p);
+          if (st.isSymbolicLink()) entries.push({ path: rel, type: 'link', target: fs.readlinkSync(p) });
+          else if (st.isDirectory()) { entries.push({ path: rel, type: 'directory' }); todo.push(p); }
+          else entries.push({ path: rel, type: 'file', executable: st.mode & 0o111, size: st.size, sha256: require('node:crypto').createHash('sha256').update(fs.readFileSync(p)).digest('hex') });
+        }
+      }
+      entries.sort((a, b) => a.path.localeCompare(b.path));
+      return require('node:crypto').createHash('sha256').update(JSON.stringify(entries)).digest('hex');
+    };
+    // Same-version content updates must export even when no staging baseline
+    // exists (the compatibility path used by direct exports and old sessions).
+    fs.writeFileSync(path.join(pkg, 'new-runtime-file.js'), 'changed package bytes');
+    const updated = exportClaudeRuntime(root, session);
+    assert.equal(updated.version, '9.8.7');
+    assert.notEqual(updated.sha256, result.sha256, 'same-version byte updates must create a new immutable slot');
+    const activePath = path.join(root, 'npm-global/linux-x64/active.json');
+    const updatedActive = JSON.parse(fs.readFileSync(activePath, 'utf8'));
+    const slotsRoot = path.join(root, 'npm-global/linux-x64/slots');
+    const slotsBefore = fs.readdirSync(slotsRoot).sort();
+    const pointerBefore = fs.readFileSync(activePath);
+    const pointerMtimeBefore = fs.statSync(activePath).mtimeMs;
+    const archivePath = path.join(root, 'npm-global/linux-x64', updatedActive.slot, 'claude-package.tar.gz');
+    const archiveMtimeBefore = fs.statSync(archivePath).mtimeMs;
+    const originPath = path.join(session, '.claude-origin.json');
+    fs.writeFileSync(originPath, JSON.stringify({ active: updatedActive, scopeFingerprint: fingerprint(scope) }), { mode: 0o600 });
+    const unchanged = exportClaudeRuntime(root, session);
+    assert.equal(unchanged.unchanged, true);
+    assert.deepEqual(fs.readdirSync(slotsRoot).sort(), slotsBefore, 'unchanged round trip must not create another slot');
+    assert.deepEqual(fs.readFileSync(activePath), pointerBefore, 'unchanged round trip must preserve active pointer bytes');
+    assert.equal(fs.statSync(activePath).mtimeMs, pointerMtimeBefore, 'unchanged round trip must not rewrite active pointer');
+    assert.equal(fs.statSync(archivePath).mtimeMs, archiveMtimeBefore, 'unchanged round trip must not touch the active slot');
+    // A different session that started from the prior pointer must not publish
+    // its stale package over an active pointer that has since advanced.
+    fs.writeFileSync(originPath, JSON.stringify({ active, scopeFingerprint: fingerprint(scope) }), { mode: 0o600 });
+    assert.throws(() => exportClaudeRuntime(root, session), /refusing stale Claude runtime export/);
   } finally { fs.rmSync(t, { recursive: true, force: true }); }
 }
 
@@ -92,6 +133,16 @@ function main() {
     assert.equal(fs.statSync(staged.ccSwitch).isFile(), true);
     assert.equal(fs.existsSync(staged.claude), true);
     const active = JSON.parse(fs.readFileSync(path.join(root, 'npm-global/linux-x64/active.json'), 'utf8'));
+    const pointerPath = path.join(root, 'npm-global/linux-x64/active.json');
+    const pointerBytes = fs.readFileSync(pointerPath); const pointerMtime = fs.statSync(pointerPath).mtimeMs;
+    const slotsDir = path.join(root, 'npm-global/linux-x64/slots'); const slotNames = fs.readdirSync(slotsDir).sort();
+    const archivePath = path.join(root, 'npm-global/linux-x64', active.slot, 'claude-package.tar.gz'); const slotMtime = fs.statSync(archivePath).mtimeMs;
+    const noChange = exportClaudeRuntime(root, staged.sessionRoot);
+    assert.equal(noChange.unchanged, true, 'staged unmodified Claude runtime should be a no-op export');
+    assert.deepEqual(fs.readFileSync(pointerPath), pointerBytes);
+    assert.equal(fs.statSync(pointerPath).mtimeMs, pointerMtime);
+    assert.equal(fs.statSync(archivePath).mtimeMs, slotMtime);
+    assert.deepEqual(fs.readdirSync(slotsDir).sort(), slotNames);
     const npmManifest = JSON.parse(fs.readFileSync(path.join(root, 'npm-global/linux-x64', active.slot, 'manifest.json'), 'utf8'));
     assert.equal(npmManifest.name, '@anthropic-ai/claude-code');
     assert.match(npmManifest.registryIntegrity, /^sha512-/);

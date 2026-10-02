@@ -266,5 +266,5 @@ try {
     $env:LOCALAPPDATA=$script:OriginalLocalAppData
 }
 Write-Host ('Named-pipe IPC integration checks: '+$script:Pass+' passed, '+$script:Fail+' failed')
-if($script:Fail){exit 1}
-exit 0
+if($script:Fail){[Environment]::Exit(1)}
+[Environment]::Exit(0)

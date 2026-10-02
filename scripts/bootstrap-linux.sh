@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
+unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH
 
 # Download and package verified Linux x64 runtime assets for the portable USB
 # tree. This script uses the host's existing tools only; it never installs an
