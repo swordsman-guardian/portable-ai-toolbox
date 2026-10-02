@@ -22,3 +22,15 @@ Microsoft Edge WebView2 Fixed Version Runtime: bundled component notices
 
 The native isolation adapter is toolbox source under scripts/; it is not a modified
 CC Switch executable. Software versions and hashes are recorded in release-manifest.json.
+
+Optional Linux x86_64 bundle:
+Node and npm notices are retained inside runtime/linux-x64/node-runtime.tar.xz.
+uv uses the same Apache/MIT notices listed above.
+Linux Git and bubblewrap retain Ubuntu package copyright/license files inside
+tools/linux-x64/git-runtime.tar.gz and runtime/linux-x64/bwrap-runtime.tar.gz.
+  https://git-scm.com/ ; https://github.com/containers/bubblewrap
+Managed CPython's notices are retained inside tools/linux-x64/python312-runtime.tar.gz.
+The official CC Switch AppImage is unchanged and uses the CC Switch license above.
+Claude's upstream package notices are retained in its active Linux runtime archive.
+Linux versions and archive hashes are recorded in runtime/linux-x64/manifest.json
+and npm-global/linux-x64/active.json plus its referenced slot manifest.

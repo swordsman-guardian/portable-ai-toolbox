@@ -1,6 +1,6 @@
 # 便携 AI 工具箱 / Portable AI Toolbox
 
-面向 Windows 的 U 盘便携 AI 编程工具箱 MVP。此仓库保存源码、测试和设计说明，不包含个人配置或可直接运行的完整 U 盘镜像。
+面向 Windows 和 Linux 的 U 盘便携 AI 编程工具箱 MVP。同一个盘保存两套运行时和一份加密供应商配置，入口按系统选择对应实现。此仓库保存源码、测试和设计说明，不包含个人配置或可直接运行的完整 U 盘镜像。
 
 ## 当前能力
 
@@ -9,12 +9,14 @@
 - CC Switch 与电脑上既有实例分离；支持联网检测及受管 Claude Code 升级。
 - Claude Code 已完成真实原生界面升级验收：2.1.281 → 2.1.285。程序包优先从固定国内镜像下载，依据官方元数据校验，失败回退官方源。
 - 其他 harness 的原生安装、升级还需逐项适配和验收。
+- Linux 使用官方 CC Switch AppImage、盘内 Node/Python/uv/Git 和便携隔离组件；运行时在本机私有目录展开，适应 FAT32 和禁止直接执行程序的 U 盘挂载方式。具体要求、启动方式及验证范围见 [Linux 使用说明](docs/Linux便携使用.md)。
 
 ## 目录
 
 - `AI.cmd`：日常启动入口。
 - `AI设置.cmd`：设置入口。
 - `AI诊断.cmd`：CC Switch 无法识别 Claude Code 时的离线诊断入口，不需要解锁配置。
+- `AI.sh`、`AI设置.sh`、`AI诊断.sh`：对应的 Linux 入口。用 `bash AI.sh` 启动，不要求在 U 盘上保存执行权限。
 - `scripts/`：PowerShell、Python、Node 与原生隔离适配源码，以及回归测试。
 - `harness/registry.json`：不含凭据的 harness 适配定义。
 - `docs/`：经过筛选的设计与使用文档；部分文档记录历史阶段，以当前源码为准。
@@ -50,6 +52,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-cc-switch-harne
 ```
 
 部分集成测试需要 Windows 隔离能力、相应运行时或编译工具链。第三方软件从各自官方渠道获取，其许可证由各项目提供。
+
+Linux 的程序包准备入口为 `bash scripts/bootstrap-linux.sh /目标盘路径`，只需在准备程序包时联网；已经备好依赖的 U 盘在下一台电脑上直接启动。准备脚本与日常启动的系统要求不同，详见 Linux 使用说明。加密格式互操作和入口测试可使用 `node scripts/test-linux-encrypted-store.cjs`、`node scripts/test-linux-launch.cjs`；真实隔离测试还需要 Linux 运行时及允许普通用户创建命名空间的内核。
+
+打包脚本增加 `-IncludeLinux`，按经过校验的程序包清单组装 Windows/Linux x64 同盘包；默认仍生成 Windows 包。两种包均从空配置模板开始，不包含用户的保险箱、供应商、历史会话或恢复文件。
 
 ## 预发布便携包
 
