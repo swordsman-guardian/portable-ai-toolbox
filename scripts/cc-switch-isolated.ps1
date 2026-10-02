@@ -80,7 +80,9 @@ if ($Action -eq 'SecureManager') {
     # prompts for its master password. The host safely handles stale locators.
     if ($locatorAvailable) { Assert-CcSecureSessionStaleLocator -StickRoot $StickRoot -PipeName $pipeName -LocatorPath $locatorPath | Out-Null }
     $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $managerArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$manager,'-StickRoot',$StickRoot,'-NetworkMode',$NetworkMode)
+    $windowWrapper = Join-Path $PSScriptRoot 'cc-switch-secure-manager-window.ps1'
+    if (-not (Test-Path -LiteralPath $windowWrapper -PathType Leaf)) { throw 'Secure manager window wrapper is missing.' }
+    $managerArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$windowWrapper,'-StickRoot',$StickRoot,'-NetworkMode',$NetworkMode)
     if ($ImportToolboxBeforeLaunch) { $managerArgs += '-ImportToolboxBeforeLaunch' }
     $quoted = @($managerArgs | ForEach-Object { Quote-SecureManagerArgument ([string]$_) })
     Start-Process -FilePath $powershell -ArgumentList $quoted -WindowStyle Normal -ErrorAction Stop | Out-Null

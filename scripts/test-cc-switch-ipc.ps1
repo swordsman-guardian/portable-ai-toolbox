@@ -10,7 +10,11 @@ $script:TestRoot=Join-Path ([IO.Path]::GetTempPath()) ('cc-ipc-root-'+[guid]::Ne
 $script:TestLocalAppData=Join-Path $script:TestRoot 'local-app-data'
 $script:TestLocator=Join-Path $script:TestLocalAppData 'AiStick\SecureSessions\synthetic.json'
 $script:OriginalLocalAppData=$env:LOCALAPPDATA
-$script:MockCommandLine='powershell.exe -File cc-switch-secure-session.ps1 '+$script:TestRoot
+$script:SecureSessionScript=Join-Path $PSScriptRoot 'cc-switch-secure-session.ps1'
+$script:SecureManagerWindowScript=Join-Path $PSScriptRoot 'cc-switch-secure-manager-window.ps1'
+$script:MockCommandLine='powershell.exe -File "'+$script:SecureSessionScript+'" -StickRoot "'+$script:TestRoot+'"'
+$script:MockProcessMissing=$false
+$script:MockCommandLineUnavailable=$false
 $script:Pass=0
 $script:Fail=0
 
@@ -20,11 +24,17 @@ function Test-CcSecureSessionPipeAvailable([string]$StickRoot,[string]$PipeName)
 function Get-CimInstance {
     [CmdletBinding()]
     param([Parameter(Position=0)][string]$ClassName,[string]$Filter)
+    if($script:MockProcessMissing){return $null}
+    if($script:MockCommandLineUnavailable){return [pscustomobject]@{ProcessId=$PID}}
     return [pscustomobject]@{ProcessId=$PID;CommandLine=$script:MockCommandLine}
 }
 function Assert-Ipc([string]$Name,[bool]$Condition){
     if($Condition){$script:Pass++;Write-Host ('PASS '+$Name) -ForegroundColor Green}
     else{$script:Fail++;Write-Host ('FAIL '+$Name) -ForegroundColor Red}
+}
+function Test-IpcHostCommandFromShadowedScope([string]$CommandLine,[string]$Root){
+    $scriptDir='C:\synthetic-wrong-caller-scope'
+    return Test-CcSecureHostCommandLine -CommandLine $CommandLine -Root $Root
 }
 function New-IpcLocator {
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $script:TestLocator))
@@ -116,6 +126,17 @@ try {
     [void][IO.Directory]::CreateDirectory($script:TestRoot)
     [void][IO.Directory]::CreateDirectory($script:TestLocalAppData)
     $env:LOCALAPPDATA=$script:TestLocalAppData
+    $sessionCommand='powershell.exe -NoProfile -File "'+$script:SecureSessionScript+'" -StickRoot "'+$script:TestRoot+'"'
+    $wrapperCommand='powershell.exe -NoProfile -File "'+$script:SecureManagerWindowScript+'" -StickRoot "'+$script:TestRoot+'"'
+    $sameNameOtherDirectory='powershell.exe -NoProfile -File "'+(Join-Path $script:TestRoot 'cc-switch-secure-manager-window.ps1')+'" -StickRoot "'+$script:TestRoot+'"'
+    $mentionOnly='powershell.exe -Command "Write-Host cc-switch-secure-manager-window.ps1 '+$script:TestRoot+'"'
+    $wrongRootCommand='powershell.exe -NoProfile -File "'+$script:SecureManagerWindowScript+'" -StickRoot "'+(Join-Path $script:TestRoot 'different-root')+'"'
+    Assert-Ipc 'authenticates the direct secure-session -File entrypoint for the exact root' (Test-CcSecureHostCommandLine $sessionCommand $script:TestRoot)
+    Assert-Ipc 'authenticates the secure-manager-window -File entrypoint for the exact root' (Test-CcSecureHostCommandLine $wrapperCommand $script:TestRoot)
+    Assert-Ipc 'entrypoint path is stable when a caller function shadows scriptDir' (Test-IpcHostCommandFromShadowedScope $wrapperCommand $script:TestRoot)
+    Assert-Ipc 'rejects an otherwise valid script command using another root' (-not (Test-CcSecureHostCommandLine $wrongRootCommand $script:TestRoot))
+    Assert-Ipc 'rejects same-name script outside the official scripts directory' (-not (Test-CcSecureHostCommandLine $sameNameOtherDirectory $script:TestRoot))
+    Assert-Ipc 'rejects command lines that only mention an official script path' (-not (Test-CcSecureHostCommandLine $mentionOnly $script:TestRoot))
     Assert-Ipc 'manager starts the existing unlock host only when no live pipe exists' ((Get-CcSecureManagerSessionDisposition -PipeAvailable $false -LocatorAvailable $false) -eq 'Start')
     Assert-Ipc 'manager treats a dead pipe with stale locator as an unlock-host start' ((Get-CcSecureManagerSessionDisposition -PipeAvailable $false -LocatorAvailable $true) -eq 'Start')
     Assert-Ipc 'manager reuses only a live pipe with a locator' ((Get-CcSecureManagerSessionDisposition -PipeAvailable $true -LocatorAvailable $true) -eq 'Reuse')
@@ -191,7 +212,15 @@ try {
     try {$null=Send-CcSecureSessionRequest -Root $script:TestRoot -Action Status} catch {$staleMessage=$_.Exception.Message;$staleRejected=$staleMessage -like '*does not match the protected locator*'}
     if(-not $staleRejected){Write-Host ('Stale locator rejection was: '+$staleMessage)}
     Assert-Ipc 'stale or unrelated locator process is rejected before pipe connect' $staleRejected
-    $script:MockCommandLine='powershell.exe -File cc-switch-secure-session.ps1 '+$script:TestRoot
+    $script:MockCommandLine='powershell.exe -File "'+$script:SecureSessionScript+'" -StickRoot "'+$script:TestRoot+'"'
+
+    $script:MockProcessMissing=$true;$missingProcessMessage=''
+    try {$null=Send-CcSecureSessionRequest -Root $script:TestRoot -Action Status} catch {$missingProcessMessage=$_.Exception.Message}
+    Assert-Ipc 'missing host process has a distinct safe locator error' ($missingProcessMessage -like '*process from the protected locator is missing*')
+    $script:MockProcessMissing=$false;$script:MockCommandLineUnavailable=$true;$missingCommandLineMessage=''
+    try {$null=Send-CcSecureSessionRequest -Root $script:TestRoot -Action Status} catch {$missingCommandLineMessage=$_.Exception.Message}
+    Assert-Ipc 'unavailable host command line has a distinct safe error' ($missingCommandLineMessage -like '*command line is unavailable*')
+    $script:MockCommandLineUnavailable=$false
 
     Write-Host 'RUN oversized locator check'
     New-IpcLocator

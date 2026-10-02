@@ -11,6 +11,14 @@ function Get-CcSwitchHarnessRuntimeFullPath {
     return $full
 }
 
+function Get-CcSwitchHarnessRuntimeSha256 {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToUpperInvariant()) }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+
 function Test-CcSwitchHarnessRuntimeWithin {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Root)
     $p = Get-CcSwitchHarnessRuntimeFullPath $Path
@@ -277,9 +285,9 @@ function Add-CcSwitchManagedClaudeNpmAdapter {
         $source = Join-Path $PSScriptRoot $moduleName
         $destination = Join-Path $updates $moduleName
         if ([IO.File]::Exists($destination)) { throw ('Refusing to replace an existing portable Claude module: '+$moduleName) }
-        $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+        $sourceHash = Get-CcSwitchHarnessRuntimeSha256 -Path $source
         [IO.File]::Copy($source,$destination,$false)
-        if (-not [string]::Equals($sourceHash,(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash,[StringComparison]::OrdinalIgnoreCase)) { throw ('Copied portable Claude module failed SHA-256 verification: '+$moduleName) }
+        if (-not [string]::Equals($sourceHash,(Get-CcSwitchHarnessRuntimeSha256 -Path $destination),[StringComparison]::OrdinalIgnoreCase)) { throw ('Copied portable Claude module failed SHA-256 verification: '+$moduleName) }
     }
     $adapter = Join-Path $slot 'npm.cmd'
     if ([IO.File]::Exists($adapter)) { throw 'Refusing to replace an existing slot npm adapter.' }
@@ -391,7 +399,7 @@ function Get-CcSwitchManagedHarnessTreeInventory {
             else {
                 $bytes += [long]$item.Length
                 if ($bytes -gt 4294967296 -or $entries.Count -gt 200000) { throw 'Managed harness tree exceeds inventory limits.' }
-                $entries.Add([pscustomobject]@{Path=$relative;Directory=$false;Length=[long]$item.Length;Hash=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash})
+                $entries.Add([pscustomobject]@{Path=$relative;Directory=$false;Length=[long]$item.Length;Hash=(Get-CcSwitchHarnessRuntimeSha256 -Path $item.FullName)})
             }
         }
     }

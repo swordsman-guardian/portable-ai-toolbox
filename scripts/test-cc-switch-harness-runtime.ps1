@@ -7,6 +7,9 @@ $ErrorActionPreference = 'Stop'
 $modulePath = Join-Path $PSScriptRoot 'cc-switch-harness-runtime.ps1'
 . $modulePath
 
+# The runtime must remain independent of module auto-loading and Get-FileHash.
+function Get-FileHash { throw 'Get-FileHash cmdlet must not be required by harness runtime.' }
+
 function Assert-HarnessRuntimeTest {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
@@ -35,6 +38,11 @@ $cleanupOk = $false
 try {
     [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
     [IO.File]::WriteAllText((Join-Path $fixtureRoot '.aistick-ac-probe'), 'synthetic appcontainer fixture v1', (New-Object Text.UTF8Encoding($false)))
+    $hashFixtureRoot=Join-Path $fixtureRoot 'known-hash';[IO.Directory]::CreateDirectory($hashFixtureRoot)|Out-Null
+    [IO.File]::WriteAllText((Join-Path $hashFixtureRoot 'known.txt'),'cc-switch-harness-runtime hash fixture v1',(New-Object Text.ASCIIEncoding))
+    $knownInventory=Get-CcSwitchManagedHarnessTreeInventory -Path $hashFixtureRoot
+    $knownEntry=@($knownInventory.Entries|Where-Object{-not $_.Directory})[0]
+    Assert-HarnessRuntimeTest ($knownEntry.Hash -ceq 'A0238CBC2E00B11EE4992D62A9E4242BD1FE7BD117F3C8114C9C31539B1D9E6F') 'Managed tree hashing must match the known SHA-256 fixture without Get-FileHash.'
     foreach ($directory in @($appDir, $syntheticStick, $syntheticNode, (Join-Path $syntheticNode 'node_modules'))) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
     Copy-Item -LiteralPath $sourceNodeExe -Destination (Join-Path $syntheticNode 'node.exe')
     Copy-Item -LiteralPath (Join-Path $sourceNode 'node_modules\npm') -Destination (Join-Path $syntheticNode 'node_modules\npm') -Recurse

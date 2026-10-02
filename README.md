@@ -14,6 +14,7 @@
 
 - `AI.cmd`：日常启动入口。
 - `AI设置.cmd`：设置入口。
+- `AI诊断.cmd`：CC Switch 无法识别 Claude Code 时的离线诊断入口，不需要解锁配置。
 - `scripts/`：PowerShell、Python、Node 与原生隔离适配源码，以及回归测试。
 - `harness/registry.json`：不含凭据的 harness 适配定义。
 - `docs/`：经过筛选的设计与使用文档；部分文档记录历史阶段，以当前源码为准。
@@ -57,3 +58,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-cc-switch-harne
 ### v0.1.0 启动解锁补丁
 
 首版在另一台电脑直接打开 AI.cmd 时可能提示缺少 secure session locator。Release 页面另附 startup-fix 小补丁，将其中 scripts 文件夹合并到工具箱根目录即可，保留现有配置和密码。修复后，交互启动会引导解锁；已有会话直接复用，非交互启动仍需预先解锁。
+
+### CC Switch 显示 Claude Code 未安装
+
+先区分工具箱中的 Claude Code 是否能启动，以及 CC Switch 是否能显示版本。显示“未安装”也可能是版本命令执行失败，不能仅凭这一提示判断程序包缺失。
+
+在出现问题的电脑上双击 `AI诊断.cmd`。诊断使用盘内程序包和全新的临时隔离环境，检查命令查找、命令入口和实际程序的版本运行；不读取保险箱、供应商或已有会话，不联网安装，不更改本机 PATH。结果保存在盘内 `logs/` 的诊断 JSON 文件中，仅包含阶段、版本、退出码和脱敏状态。诊断通过不代表 CC Switch 的真实界面检测必然通过；仍需结合界面错误判断。
+
+### 密码窗口退出或提示保存中断
+
+启动失败时，独立密码窗口会保留错误提示，按 Enter 后关闭。`AI.cmd` 和 `AI设置.cmd` 使用 Windows 自带 PowerShell 的固定路径，避免命中其他软件提供的同名入口。
+
+若上次保存中断在历史版本指针替换阶段，解锁后会验证最近已提交的配置与历史版本，将原始加密文件完整备份到盘内 `config/cc-switch/recovery-archives/`，再恢复历史指针并整理活动存储。未提交的副本保留在加密备份中，不自动替代当前配置。遇到无法确认的中断状态或认证失败会停止恢复，保留文件供进一步诊断。此备份目录与保险箱一样，不纳入 Git 或 Release。

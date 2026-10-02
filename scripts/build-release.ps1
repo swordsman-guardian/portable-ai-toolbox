@@ -71,7 +71,7 @@ if (-not $ArchiveOnly) {
     $tracked = @(& git -c ('safe.directory='+$source.Replace('\','/')) -c core.quotepath=false -C $source ls-files)
     if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate tracked source files.' }
     foreach ($relative in $tracked) {
-        if ($relative -match '^(README\.md|AI\.cmd|AI设置\.cmd|使用说明\.txt|harness/registry\.json)$' -or
+        if ($relative -match '^(README\.md|AI\.cmd|AI设置\.cmd|AI诊断\.cmd|使用说明\.txt|harness/registry\.json)$' -or
             $relative -match '^scripts/[^/]+\.(ps1|py|cpp|cjs)$' -or $relative -match '^docs/[^/]+\.md$') {
             Copy-ReleaseFile (Join-Path $source $relative) $relative
         }

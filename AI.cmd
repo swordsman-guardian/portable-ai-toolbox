@@ -21,7 +21,14 @@ if not exist "%LAUNCH%" (
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%LAUNCH%" %*
+set "PSENGINE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if defined PROCESSOR_ARCHITEW6432 set "PSENGINE=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PSENGINE%" (
+    echo [ERROR] Windows PowerShell is unavailable on this computer.
+    pause
+    exit /b 1
+)
+"%PSENGINE%" -NoProfile -ExecutionPolicy Bypass -File "%LAUNCH%" %*
 set "RC=%ERRORLEVEL%"
 
 if not "%RC%"=="0" (
@@ -30,5 +37,4 @@ if not "%RC%"=="0" (
     echo.
     pause
 )
-endlocal
 exit /b %RC%

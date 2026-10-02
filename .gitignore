@@ -5,6 +5,7 @@
 !/README.md
 !/AI.cmd
 !/AI设置.cmd
+!/AI诊断.cmd
 !/使用说明.txt
 !/scripts/
 /scripts/*
@@ -155,3 +156,8 @@
 !/docs/Release-v0.1.0.md
 !/scripts/cc-switch-startup.ps1
 !/scripts/test-cc-switch-startup.ps1
+!/scripts/diagnose-cc-switch-claude.ps1
+!/scripts/cc-switch-secure-manager-window.ps1
+!/scripts/test-cc-switch-secure-manager-window.ps1
+!/scripts/cc-switch-store-recovery.ps1
+!/scripts/test-cc-switch-store-recovery.ps1

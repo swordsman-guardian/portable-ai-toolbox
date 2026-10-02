@@ -71,6 +71,22 @@ function New-CcSecureServerPipe([string]$Name,[IO.Pipes.PipeSecurity]$Security,[
     $handle=[CcSecurePipeNative]::CreateFirstInstance(('\\.\pipe\'+$Name),$sddl,$First)
     return New-Object IO.Pipes.NamedPipeServerStream([IO.Pipes.PipeDirection]::InOut,$true,$false,$handle)
 }
+function Test-CcSecureHostCommandLine([string]$CommandLine,[string]$Root) {
+    if(-not $CommandLine -or -not $Root){return $false}
+    $rootFull=[IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $rootPattern=[regex]::Escape($rootFull)+'(?:\\)?'
+    if($rootFull -match '\s'){$rootArg='(?i)(?:^|\s)-StickRoot\s+"'+$rootPattern+'"(?=\s|$)'}
+    else{$rootArg='(?i)(?:^|\s)-StickRoot\s+(?:"'+$rootPattern+'"|'+$rootPattern+'(?=\s|$))'}
+    if($CommandLine -notmatch $rootArg){return $false}
+    foreach($scriptName in @('cc-switch-secure-session.ps1','cc-switch-secure-manager-window.ps1')) {
+        $scriptPath=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot $scriptName))
+        $scriptPattern=[regex]::Escape($scriptPath)
+        if($scriptPath -match '\s'){$fileArg='(?i)(?:^|\s)-File\s+"'+$scriptPattern+'"(?=\s|$)'}
+        else{$fileArg='(?i)(?:^|\s)-File\s+(?:"'+$scriptPattern+'"|'+$scriptPattern+'(?=\s|$))'}
+        if($CommandLine -match $fileArg){return $true}
+    }
+    return $false
+}
 function ConvertTo-CcSecureHashtable($Value) {
     if($null -eq $Value){return $null}
     if($Value -is [System.Collections.IDictionary]){$map=@{};foreach($key in $Value.Keys){$map[[string]$key]=ConvertTo-CcSecureHashtable $Value[$key]};return $map}
@@ -100,8 +116,10 @@ function Send-CcSecureSessionRequest([string]$Root,[string]$Action) {
     $rootFull=[IO.Path]::GetFullPath($Root).TrimEnd('\')
     if([string]$locator.Root -cne $rootFull -or [string]$locator.PipeName -cne $pipeName){throw 'Secure session locator does not match this volume root.'}
     $locatorProcess=Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$locator.ProcessId)" -ErrorAction Stop
-    $locatorCommand=if($locatorProcess){[string]$locatorProcess.CommandLine}else{''}
-    if(-not $locatorProcess -or -not $locatorCommand.Contains('cc-switch-secure-session.ps1') -or -not $locatorCommand.Contains([IO.Path]::GetFullPath($Root))){throw 'Secure session host process does not match the protected locator.'}
+    if(-not $locatorProcess){throw 'Secure session host process from the protected locator is missing.'}
+    if(-not $locatorProcess.PSObject.Properties['CommandLine'] -or [string]::IsNullOrWhiteSpace([string]$locatorProcess.CommandLine)){throw 'Secure session host command line is unavailable.'}
+    $locatorCommand=[string]$locatorProcess.CommandLine
+    if(-not (Test-CcSecureHostCommandLine -CommandLine $locatorCommand -Root $Root)){throw 'Secure session host process does not match the protected locator (approved entry point or root mismatch).'}
     $processObject=Get-Process -Id ([int]$locator.ProcessId) -ErrorAction Stop
     if([long]$processObject.StartTime.ToUniversalTime().Ticks -ne [long]$locator.StartTimeUtcTicks){throw 'Secure session host process has changed since locator creation.'}
     $pipe=New-Object IO.Pipes.NamedPipeClientStream('.', $pipeName, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::None)
@@ -446,9 +464,17 @@ function Stop-CcSecureGuiWorker {
 
 try {
     $storeState=Get-CcEncryptedStoreStatus -StickRoot $StickRoot
-    if($storeState.State -eq 'RecoveryRequired' -or $storeState.State -eq 'Corrupt'){throw 'Encrypted store has recovery evidence; automatic unlock is blocked.'}
+    if($storeState.State -eq 'Corrupt'){throw '加密配置结构校验失败，已停止解锁；请保留盘内文件以便恢复。'}
+    if($storeState.State -eq 'RecoveryRequired') {
+        Write-Host '检测到上次配置保存未完成。解锁后将校验最近已提交的配置，并先保留完整加密备份，再尝试恢复。' -ForegroundColor Yellow
+    }
     $createStore=($storeState.State -eq 'Absent')
     $session=Read-CcEncryptedStoreUnlockedSession -StickRoot $StickRoot -Create:$createStore
+    if($storeState.State -eq 'RecoveryRequired') {
+        . (Join-Path $scriptDir 'cc-switch-store-recovery.ps1')
+        $recovered = Repair-CcEncryptedStore -Session $session
+        Write-Host ('已恢复最近已提交的加密配置；原始加密备份：' + $recovered.ArchivePath) -ForegroundColor Green
+    }
     $migration=Join-Path $scriptDir 'cc-switch-migration.ps1'
     if(Test-Path -LiteralPath $migration -PathType Leaf){. $migration;$null=Initialize-CcEncryptedStoreFromLegacy -StickRoot $StickRoot -Session $session}
     if($ImportToolboxBeforeLaunch){
