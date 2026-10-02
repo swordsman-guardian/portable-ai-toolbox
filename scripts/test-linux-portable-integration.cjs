@@ -108,6 +108,7 @@ async function runGuiProxyIntegration(runtime, sessionRoot, workDir, syntheticPo
   } }), { mode: 0o600 });
   const state = await nativeProxy.prepareNativeProxy({ sessionRoot, network: true });
   const db = new DatabaseSync(state.dbPath);
+  db.exec('PRAGMA busy_timeout=5000');
   try {
     db.exec(`CREATE TABLE IF NOT EXISTS providers (
       id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, settings_config TEXT NOT NULL,
@@ -153,6 +154,7 @@ async function runGuiProxyIntegration(runtime, sessionRoot, workDir, syntheticPo
       let row = null, provider = null, tableNames = [];
       try {
         const diagnosticDb = new DatabaseSync(state.dbPath, { readOnly: true });
+        diagnosticDb.exec('PRAGMA busy_timeout=5000');
         try {
           row = diagnosticDb.prepare("SELECT app_type,listen_address,listen_port,proxy_enabled,enabled,live_takeover_active FROM proxy_config WHERE app_type='claude'").get();
           provider = diagnosticDb.prepare("SELECT id,app_type,is_current FROM providers WHERE app_type='claude' AND id='synthetic-portable-integration'").get();
@@ -161,7 +163,8 @@ async function runGuiProxyIntegration(runtime, sessionRoot, workDir, syntheticPo
       } catch (e) { row = { diagnosticError: e.message }; }
       throw new Error(`CC Switch GUI did not start its native proxy; db=${JSON.stringify({ row, provider, tables: tableNames })}; tcpListening=${readTcpListener(state.port)}; localConnect=${await canConnectLocal(state.port)}; ownedListener=${nativeProxy.ownedListener(state.port, state.owner)}; manager=${JSON.stringify({ pid: manager.pid, exitCode: manager.exitCode, signalCode: manager.signalCode })}; logs=${managerLog}`);
     }
-    const activeDb = new DatabaseSync(state.dbPath);
+    const activeDb = new DatabaseSync(state.dbPath, { readOnly: true });
+    activeDb.exec('PRAGMA busy_timeout=5000');
     try {
       assert.ok(activeDb.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='providers'").get(), 'actual GUI startup should retain the synthetic provider table');
       const provider = activeDb.prepare("SELECT id,is_current FROM providers WHERE app_type='claude' AND id='synthetic-portable-integration'").get();
