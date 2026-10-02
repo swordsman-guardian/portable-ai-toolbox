@@ -37,5 +37,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-cc-switch-ipc.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/test-cc-switch-ipc.ps1') -WorkingDirectory $PWD.Path -NoNewWindow -PassThru -Wait
+          $testProcess.Refresh()
+          $testExitCode = $testProcess.ExitCode
+          if ($null -eq $testExitCode) { throw 'Could not read the Windows IPC test process exit code.' }
+          Write-Host "Windows IPC test process exited with code $testExitCode."
+          exit $testExitCode
