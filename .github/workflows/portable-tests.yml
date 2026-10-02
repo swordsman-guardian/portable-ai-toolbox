@@ -36,4 +36,6 @@ jobs:
       - name: Windows protected session authentication
         if: runner.os == 'Windows'
         shell: powershell
-        run: ./scripts/test-cc-switch-ipc.ps1
+        run: |
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-cc-switch-ipc.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
