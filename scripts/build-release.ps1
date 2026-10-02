@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$SourceRoot = '',
     [Parameter(Mandatory)][string]$OutputDirectory,
     [ValidatePattern('^\d+\.\d+\.\d+(?:-[a-z0-9.]+)?$')][string]$Version = '0.1.0',
     [switch]$StageOnly,
@@ -11,6 +11,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) { $SourceRoot = Split-Path -Parent $PSScriptRoot }
 if ($StageOnly -and $ArchiveOnly) { throw 'StageOnly and ArchiveOnly are mutually exclusive.' }
 $source = [IO.Path]::GetFullPath($SourceRoot)
 if ($source -ne [IO.Path]::GetPathRoot($source)) { $source = $source.TrimEnd('\') }
