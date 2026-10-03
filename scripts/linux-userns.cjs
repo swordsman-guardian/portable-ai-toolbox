@@ -242,12 +242,12 @@ function runParser(parser, args, text, hooks = {}) {
   return result;
 }
 
-function sudoCommand(profile, runtime, hooks = {}) {
+function sudoCommand(profile, runtime, parser, hooks = {}) {
   const launch = hooks.spawn || spawn;
   const sudo = '/usr/bin/sudo';
   const sudoStat = hooks.sudoStat ? hooks.sudoStat(sudo) : fs.lstatSync(sudo);
   if (!sudoStat.isFile() || sudoStat.isSymbolicLink() || sudoStat.uid !== 0 || (sudoStat.mode & 0o022) || !(sudoStat.mode & 0o111)) throw new Error('the trusted sudo executable is unavailable or not protected');
-  const child = launch(sudo, ['--', '/bin/sh', '-c', STATIC_HELPER, 'portable-ai-apparmor', hooks.parser, profile.name, profile.attachment, runtime.sessionRoot], {
+  const child = launch(sudo, ['--', '/bin/sh', '-c', STATIC_HELPER, 'portable-ai-apparmor', parser, profile.name, profile.attachment, runtime.sessionRoot], {
     cwd: runtime.sessionRoot, env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C' },
     stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
   });
@@ -278,7 +278,7 @@ async function ensureSandboxUserns(runtime, options = {}) {
   }));
   const answer = await ask(`AppArmor 阻止了本次 user namespace。临时规则只作用于当前会话使用的这一个 bubblewrap 文件；sudo 会在本地终端请求管理员密码。输入 ${CONSENT_TOKEN} 允许，其他输入取消：`);
   if (answer !== CONSENT_TOKEN) throw new Error('AppArmor authorization was declined; sandbox startup stopped.');
-  const child = sudoCommand(profile, rt, options.hooks || {});
+  const child = sudoCommand(profile, rt, parser, options.hooks || {});
   let stdout = ''; let stderr = '';
   child.stdout?.on('data', chunk => { stdout = (stdout + chunk.toString()).slice(-256); });
   child.stderr?.on('data', chunk => { const value = chunk.toString(); stderr = (stderr + value).slice(-1024); process.stderr.write(value); });

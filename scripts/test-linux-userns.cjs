@@ -188,6 +188,7 @@ async function main() {
     assert.equal(loadCall.args[1], '/bin/sh');
     assert.equal(loadCall.args[2], '-c');
     assert.equal(loadCall.args[3], STATIC_HELPER);
+    assert.equal(loadCall.args[5], '/usr/sbin/apparmor_parser', 'the validated absolute parser path reaches the helper');
     assert.equal(loadCall.args[6], ensured.authorization.profile.name);
     assert.match(loadCall.args[3], /-K -a/, 'profile load uses add-only semantics');
     assert.doesNotMatch(loadCall.args[3], /-r|--replace/, 'helper never requests profile replacement');
