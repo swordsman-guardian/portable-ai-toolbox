@@ -65,6 +65,8 @@ node scripts/test-linux-portable-integration.cjs /目标盘路径 --gui
 
 本轮实测环境为 Windows x64 / PowerShell 5.1 和 WSL2 内的 Ubuntu 24.04 x86_64。已通过加密格式双向互操作、TTY 密码入口、并发历史归档、断盘加密恢复、真实 Node/Git/Claude 运行、私有 HOME 与项目目录边界、密钥不出现在启动参数中，以及 uv 在私有目录创建并执行 Python 环境的测试。已装配的 Linux 基础版本为 Node 22.23.3、Claude Code 2.1.287、CC Switch 3.20.4。
 
+Ubuntu 24.04 的 GitHub 托管 runner 已验证真实 AppArmor 分支：限制值为 1 时，当前 bwrap 最初被拒绝；加载准确路径的临时规则后可以执行，复制到另一位置的 bwrap 仍被拒绝。重复授权不会替换或卸载已有规则；正常释放、控制管道关闭和终止信号后的撤销均通过内核规则列表确认。测试未修改全局命名空间限制，也未安装系统软件。本机 WSL 没有启用 AppArmor，因此这部分验收以云端 runner 为准。
+
 官方 CC Switch AppImage 已在隔离环境中真实显示窗口，并通过退出清理测试。通过原生升级使用的 npm 命令重装当前最新版 Claude 后，已经验证程序包归档、激活新槽位和全新会话再次启动；没有把本机 HOME、缓存或供应商配置混入升级包。
 
 原生代理集成已通过：官方窗口拥有随机端口，Claude Code 经该代理访问本地合成 Anthropic 流式接口，并获得回复；原有 15721 端口服务保持可用。测试不使用真实供应商密钥、不产生模型费用。还验证了 CC Switch 断盘清理、SIGHUP 关闭终端清理，以及归档文件的符号链接拒绝与大小限制。

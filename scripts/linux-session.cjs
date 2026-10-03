@@ -439,6 +439,7 @@ async function recoverOrphanSession(root, sessionDir, password) {
   const metadataFile = path.join(sessionDir, '.portable-session.json'); assertNoLinks(metadataFile);
   const meta = JSON.parse(readRegularFileBounded(metadataFile, 80 * 1024 * 1024, 'Private session recovery metadata').toString('utf8'));
   if (meta.version !== 1 || !/^linux-[A-Za-z0-9-]+$/.test(meta.id || '') || !['claude', 'cc-switch'].includes(meta.kind) || !/^[0-9a-f]{64}$/.test(meta.workHash || '') && meta.kind === 'claude') throw new Error('Abandoned private session metadata is invalid.');
+  assertOrphanProfileReleased(sessionDir, meta);
   const live = meta.owner?.bootId === bootId() && processStartTime(Number(meta.owner.pid)) === meta.owner.start;
   if (live) throw new Error('Private session still belongs to a live toolbox process.');
   for (const child of meta.children || []) {
@@ -491,6 +492,8 @@ async function recoverOrphanSessions(root) {
     let meta;
     try { assertNoLinks(metadata); meta = JSON.parse(readRegularFileBounded(metadata, 80 * 1024 * 1024, 'Private session recovery metadata').toString('utf8')); }
     catch (e) { console.error(`本机隔离会话元数据无效，保留目录：${sessionDir}；${e.message}`); continue; }
+    try { assertOrphanProfileReleased(sessionDir, meta); }
+    catch (e) { console.error(`遗留会话仍可能关联活动的 AppArmor 授权，保留目录且不请求密码：${sessionDir}；${e.message}`); continue; }
     if (meta.owner?.bootId === bootId() && processStartTime(Number(meta.owner.pid)) === meta.owner.start) continue;
     if (!process.stdin.isTTY) { console.error(`发现异常退出遗留的本机隔离目录；非交互运行不会解锁或删除它：${sessionDir}`); continue; }
     const confirm = await ask(`发现异常退出遗留的隔离会话。输入 ENCRYPT 将其加密转入恢复队列：`);
@@ -504,6 +507,22 @@ async function recoverOrphanSessions(root) {
         console.error(`未能安全加密遗留会话，完整保留原目录：${sessionDir}；${e.message}`); break;
       }
     }
+  }
+}
+
+function assertOrphanProfileReleased(sessionDir, meta) {
+  const marker = path.join(sessionDir, '.apparmor-cleanup-unconfirmed');
+  let markerStat;
+  try { markerStat = fs.lstatSync(marker); }
+  catch (e) { if (e.code === 'ENOENT') return; throw e; }
+  if (markerStat.isSymbolicLink() || !markerStat.isFile()) throw new Error('AppArmor cleanup marker is not a regular owned file; refusing orphan recovery.');
+  assertNoLinks(marker);
+  readRegularFileBounded(marker, 4096, 'AppArmor cleanup marker');
+  const currentBoot = bootId();
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const ownerBoot = meta.owner?.bootId;
+  if (!uuid.test(currentBoot) || !uuid.test(ownerBoot || '') || ownerBoot.toLowerCase() === currentBoot.toLowerCase()) {
+    throw new Error('AppArmor cleanup was not confirmed and the owner boot identity is current or unknown.');
   }
 }
 

@@ -484,8 +484,9 @@ async function run() {
     ui.writePrivateOwner(orphan);
     const ownerFile = path.join(orphan.dir, '.portable-session.json');
     const orphanMetadata = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
-    orphanMetadata.owner = { pid: 2147483647, bootId: ui.usbIdentity(root).mountId || 'dead-boot-id', start: '1' };
+    orphanMetadata.owner = { pid: 2147483647, bootId: '11111111-1111-4111-8111-111111111111', start: '1' };
     fs.writeFileSync(ownerFile, JSON.stringify(orphanMetadata), { mode: 0o600 });
+    fs.writeFileSync(path.join(orphan.dir, '.apparmor-cleanup-unconfirmed'), 'synthetic stale profile marker', { mode: 0o600 });
     const orphanRecovery = await ui.recoverOrphanSession(root, orphan.dir, password);
     assert.equal(fs.existsSync(orphan.dir), false, 'verified crash-orphan recovery must remove the plaintext private tree');
     assert.ok(fs.existsSync(orphanRecovery));
@@ -496,7 +497,41 @@ async function run() {
     const orphanSession = store.openStore(root, password);
     assert.equal(ui.validateHistoryPayload(store.openArchive(orphanSession, fs.readFileSync(orphanArchive), { kind: 'claude-session-archive' }), orphan.workHash).get('projects/orphan.jsonl').toString(), 'orphan-crash-history');
     orphanSession.close();
-    assert.equal(ui.sessionCount(), 0, 'orphan recovery and every normal close must release in-memory session records');
+    assert.equal(ui.sessionCount(), 0, 'completed orphan recovery must release its in-memory session record');
+
+    const blockedOrphan = await ui.createPrivateSession(root, 'claude'); blockedOrphan.opened = store.openStore(root, password);
+    blockedOrphan.workHash = 'd'.repeat(64); blockedOrphan.claudeConfigDir = path.join(blockedOrphan.dir, 'harness', 'cc-switch', 'claude');
+    const blockedTranscript = path.join(blockedOrphan.claudeConfigDir, 'projects', 'must-retain.jsonl');
+    fs.mkdirSync(path.dirname(blockedTranscript), { recursive: true }); fs.writeFileSync(blockedTranscript, 'retained-unconfirmed-profile-data');
+    ui.writePrivateOwner(blockedOrphan);
+    const blockedOwnerFile = path.join(blockedOrphan.dir, '.portable-session.json');
+    const blockedMetadata = JSON.parse(fs.readFileSync(blockedOwnerFile, 'utf8'));
+    blockedMetadata.owner = { pid: 2147483647, bootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(), start: '1' };
+    fs.writeFileSync(blockedOwnerFile, JSON.stringify(blockedMetadata), { mode: 0o600 });
+    fs.writeFileSync(path.join(blockedOrphan.dir, '.apparmor-cleanup-unconfirmed'), 'synthetic active-boot uncertainty', { mode: 0o600 });
+    const unchangedRevision = store.storeStatus(root).currentRevision;
+    await assert.rejects(ui.recoverOrphanSession(root, blockedOrphan.dir, 'wrong-synthetic-password'), /AppArmor cleanup was not confirmed/, 'the marker guard must run before password validation');
+    assert.equal(fs.existsSync(blockedOrphan.dir), true, 'same-boot uncertain policy marker must preserve plaintext directory');
+    assert.equal(store.storeStatus(root).currentRevision, unchangedRevision, 'refused marked orphan recovery must not change encrypted revision');
+    let orphanSkipMessage = '';
+    const oldError = console.error;
+    console.error = (message) => { orphanSkipMessage += `${message}\n`; };
+    try { await ui.recoverOrphanSessions(root); }
+    finally { console.error = oldError; }
+    assert.match(orphanSkipMessage, /不请求密码/,'automatic recovery must skip marked current-boot orphans before password prompts');
+    assert.equal(fs.existsSync(blockedOrphan.dir), true);
+
+    const invalidBootOrphan = await ui.createPrivateSession(root, 'claude'); invalidBootOrphan.opened = store.openStore(root, password);
+    invalidBootOrphan.workHash = 'f'.repeat(64); invalidBootOrphan.claudeConfigDir = path.join(invalidBootOrphan.dir, 'harness', 'cc-switch', 'claude');
+    ui.writePrivateOwner(invalidBootOrphan);
+    const invalidOwnerFile = path.join(invalidBootOrphan.dir, '.portable-session.json');
+    const invalidMetadata = JSON.parse(fs.readFileSync(invalidOwnerFile, 'utf8'));
+    invalidMetadata.owner = { pid: 2147483647, bootId: 'unknown', start: '1' };
+    fs.writeFileSync(invalidOwnerFile, JSON.stringify(invalidMetadata), { mode: 0o600 });
+    fs.writeFileSync(path.join(invalidBootOrphan.dir, '.apparmor-cleanup-unconfirmed'), 'synthetic invalid boot identity', { mode: 0o600 });
+    await assert.rejects(ui.recoverOrphanSession(root, invalidBootOrphan.dir, password), /AppArmor cleanup was not confirmed/);
+    assert.equal(fs.existsSync(invalidBootOrphan.dir), true, 'unknown owner boot identity must preserve marked orphan');
+    blockedOrphan.opened.close(); invalidBootOrphan.opened.close();
     console.log('Linux encrypted multi-session lifecycle checks passed.');
   } finally {
     for (const record of testSessions) {
