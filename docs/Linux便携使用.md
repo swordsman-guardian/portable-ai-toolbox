@@ -10,7 +10,11 @@ bash AI.sh
 
 ## 程序包与运行要求
 
-目前 Linux 程序包面向 x86_64、glibc 2.38 或更新版本（例如 Ubuntu 24.04）。需要普通用户可用的用户命名空间，以及能运行官方 CC Switch Linux 包的桌面环境。禁止用户命名空间的电脑会停止隔离启动，不会自动改为不隔离运行；无需安装隔离服务、修改系统安全策略或使用管理员权限。ARM、Alpine/musl 和较旧的 glibc 尚不属于本包的支持范围。
+目前 Linux 程序包面向 x86_64、glibc 2.38 或更新版本（例如 Ubuntu 24.04）。需要能运行官方 CC Switch Linux 包的桌面环境，以及可用或经管理员允许的用户命名空间。启动器先用真正要运行的盘内 bwrap 预检，再询问配置主密码。禁止用户命名空间且无法授权的电脑会停止隔离启动，不会自动改为不隔离运行。ARM、Alpine/musl 和较旧的 glibc 尚不属于本包的支持范围。
+
+Ubuntu 的 AppArmor 限制阻止预检时，启动器会说明原因；用户输入 `APPARMOR` 同意后，由 sudo 在本机终端询问管理员密码。此密码不要发到聊天或填入供应商配置。授权只针对当前会话 bwrap 的准确可执行路径，不使用覆盖其他会话的路径通配符；取消授权或授权失败时不解密配置、不保存新版本。其他原因造成的启动失败不会自动请求 AppArmor 授权。
+
+授权会临时修改内核中的 AppArmor 策略，不等同于“没有修改系统策略”。辅助进程只负责加载和撤销该规则，CC Switch、Claude 及初始化任务仍以普通用户运行。规则经标准输入传给系统 apparmor_parser，禁止写策略缓存，不安装服务、不写 `/etc/apparmor.d`、不关闭全局安全功能。会话退出或管理进程关闭管道时，辅助进程撤销它加载的规则；未确认撤销时会明确报告并提供手工撤销命令。临时规则不会在重启后由本工具箱重新加载，因此新的会话可能需要再次授权。这仍是免安装使用，但受限电脑不能保证免管理员授权。
 
 图形化 CC Switch 需要可用的 X11 或 Wayland 桌面，以及桌面环境通常提供的 `dbus-run-session`；启动器为窗口创建自己的会话总线，不连接本机 CC Switch 使用的总线。纯终端电脑可以使用诊断及符合要求的命令行能力。Linux 发行版的基础库与桌面组件仍有差异，验证过的环境以本文后面的验收记录为准，不能把某一个发行版通过理解为所有 Linux 都通过。
 
@@ -22,7 +26,7 @@ bash AI.sh
 bash scripts/bootstrap-linux.sh /目标盘路径
 ```
 
-准备脚本限定在 Ubuntu 24.04 x86_64 上打包，并使用该电脑已有的 curl、tar、apt-get、dpkg-deb、ldd 等工具，避免在较新系统打包后无意提高运行所需的 glibc 版本。准备阶段需要联网；脚本只下载并解包依赖，不安装系统软件。已经装配好的盘不需要在每台电脑重做准备。源码仓库不上传这些下载产物。
+准备脚本限定在 Ubuntu 24.04 x86_64 上打包，并使用该电脑已有的 curl、tar、apt-get、dpkg-deb、ldd 等工具，避免在较新系统打包后无意提高运行所需的 glibc 版本。准备阶段需要联网；脚本只下载并解包依赖，不安装系统软件。它在调用隔离环境之前也执行相同的 AppArmor 预检和临时授权流程，授权由准备任务结束时撤销。已经装配好的盘不需要在每台电脑重做准备。源码仓库不上传这些下载产物。
 
 ## 配置与数据
 
@@ -51,11 +55,13 @@ node scripts/test-linux-runtime.cjs /目标盘路径
 node scripts/test-linux-sandbox.cjs /目标盘路径
 node scripts/test-linux-sandbox.cjs /目标盘路径 --gui
 node scripts/test-linux-session.cjs
+node scripts/test-linux-userns.cjs
+node scripts/test-linux-bootstrap-userns.cjs
 node scripts/test-linux-portable-integration.cjs /目标盘路径
 node scripts/test-linux-portable-integration.cjs /目标盘路径 --gui
 ```
 
-测试使用合成配置，不需要解锁用户保险箱。sandbox 测试的 `--gui` 验证窗口启动与退出；portable-integration 测试的 `--gui` 进一步验证官方 CC Switch 私有代理和真实 Claude 的请求链路。它们需要已有的可用图形显示环境，不在没有桌面的 CI 中执行。
+测试使用合成配置，不需要解锁用户保险箱。sandbox 测试的 `--gui` 验证窗口启动与退出；portable-integration 测试的 `--gui` 进一步验证官方 CC Switch 私有代理和真实 Claude 的请求链路。它们需要已有的可用图形显示环境，不在没有桌面的 CI 中执行。隔离测试探测真实 bwrap；受限系统未授权时会结束测试并显示引导，不擅自加载规则。AppArmor 单元测试使用注入的进程接口覆盖授权、取消、失败和撤销，不要求 sudo。独立的策略集成测试只允许在 GitHub 托管的临时 Linux runner 上明确启用；它检查真实规则加载、重复加载拒绝、bwrap 执行和退出撤销，不修改全局命名空间限制。runner 没有 AppArmor 能力时会明确显示跳过。
 
 本轮实测环境为 Windows x64 / PowerShell 5.1 和 WSL2 内的 Ubuntu 24.04 x86_64。已通过加密格式双向互操作、TTY 密码入口、并发历史归档、断盘加密恢复、真实 Node/Git/Claude 运行、私有 HOME 与项目目录边界、密钥不出现在启动参数中，以及 uv 在私有目录创建并执行 Python 环境的测试。已装配的 Linux 基础版本为 Node 22.23.3、Claude Code 2.1.287、CC Switch 3.20.4。
 

@@ -30,6 +30,15 @@ jobs:
       - name: Linux native proxy ownership
         if: runner.os == 'Linux'
         run: node scripts/test-linux-native-proxy.cjs
+      - name: Linux AppArmor authorization and cancellation
+        if: runner.os == 'Linux'
+        run: node scripts/test-linux-userns.cjs
+      - name: Linux bootstrap authorization workflow
+        if: runner.os == 'Linux'
+        run: node scripts/test-linux-bootstrap-userns.cjs
+      - name: Linux temporary AppArmor policy lifecycle
+        if: runner.os == 'Linux'
+        run: node scripts/test-linux-userns-privileged.cjs --allow-policy-test
       - name: Linux runtime manifest and upgrade persistence
         if: runner.os == 'Linux'
         run: node scripts/test-linux-runtime.cjs --unit-only

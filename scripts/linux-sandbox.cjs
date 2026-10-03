@@ -97,6 +97,17 @@ function addMount(args, flag, source, target) { args.push(flag, source, target);
 function socketPath(p) {
   try { const real = fs.realpathSync(p); return fs.statSync(real).isSocket() ? real : null; } catch { return null; }
 }
+function sandboxExecEnv(runtimeRoot, sandboxRoot) {
+  const roots = [runtimeRoot, sandboxRoot].filter(Boolean).map(root => path.resolve(root));
+  const loaderPaths = [];
+  for (const root of roots) {
+    for (const rel of ['lib/x86_64-linux-gnu', 'lib64']) {
+      const candidate = path.join(root, 'sandbox', rel);
+      if (fs.existsSync(candidate) && fs.lstatSync(candidate).isDirectory() && !fs.lstatSync(candidate).isSymbolicLink()) loaderPaths.push(candidate);
+    }
+  }
+  return { PATH: '/usr/bin:/bin', LANG: process.env.LANG || 'C.UTF-8', ...(loaderPaths.length ? { LD_LIBRARY_PATH: [...new Set(loaderPaths)].join(':') } : {}) };
+}
 function prepareDisplay(sessionRoot, bargs, envArgs) {
   const tempRoot = assertSessionPath(sessionRoot, path.join(sessionRoot, 'tmp'), 'private display temporary directory');
   fs.mkdirSync(tempRoot, { recursive: true, mode: 0o700 });
@@ -257,12 +268,11 @@ function buildSandbox({ sessionRoot, runtime, mode, command, args = [], workDir,
   }
   // Secret provider values are never included in argv: bwrap reads the
   // NUL-delimited tail from an anonymous pipe (FD 3).
-  const bwLibs = [path.join(runtimeRoot, 'sandbox', 'lib', 'x86_64-linux-gnu'), path.join(runtimeRoot, 'sandbox', 'lib64')].filter(p => fs.existsSync(p)).join(':');
-  const env = { PATH: '/usr/bin:/bin', LANG: process.env.LANG || 'C.UTF-8', ...(bwLibs ? { LD_LIBRARY_PATH: bwLibs } : {}) };
+  const env = sandboxExecEnv(runtimeRoot, runtime.sandboxRoot);
   if (!extraEnv || typeof extraEnv !== 'object' || Array.isArray(extraEnv) || ![Object.prototype, null].includes(Object.getPrototypeOf(extraEnv))) throw new Error('provider environment must be a plain object');
   const secretEnvArgs = [];
   for (const [key, value] of Object.entries(extraEnv || {})) {
-    if (!ENV_ALLOWLIST.has(key) || typeof value !== 'string' || value.length > 8192 || /[\0\r\n]/.test(value)) throw new Error(`unsupported provider environment entry: ${key}`);
+    if (!ENV_ALLOWLIST.has(key) || typeof value !== 'string' || value.length > 8192 || /[\0\n]/.test(value)) throw new Error(`unsupported provider environment entry: ${key}`);
     if (key === 'ANTHROPIC_BASE_URL') {
       let parsed; try { parsed = new URL(value); } catch { throw new Error('ANTHROPIC_BASE_URL must be a valid HTTP(S) URL'); }
       if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('ANTHROPIC_BASE_URL must not contain credentials and must use HTTP(S)');
@@ -276,23 +286,32 @@ function buildSandbox({ sessionRoot, runtime, mode, command, args = [], workDir,
   // CC Switch expects a desktop session bus. Give it an isolated private
   // session bus owned by this process tree; never inherit or mount the host
   // DBus socket/address.
+  let commandOffset;
   if (mode === 'cc-switch') {
     bargs.push('/usr/bin/dbus-run-session', '--');
     if (command === runtime.ccSwitch) {
       // AppImage-bundled GLib must be used by the GUI and its WebKit children,
       // while dbus-run-session itself must use the host's matching system GLib.
       // Put the bundle loader paths on the application command only.
+      commandOffset = bargs.length;
       bargs.push('/usr/bin/env',
         'LD_LIBRARY_PATH=/opt/portable/runtime/cc-switch/squashfs-root/usr/lib:/opt/portable/runtime/cc-switch/squashfs-root/usr/lib/x86_64-linux-gnu',
         'APPIMAGE=/opt/portable/runtime/cc-switch.AppImage',
         'APPDIR=/opt/portable/runtime/cc-switch/squashfs-root', guestCmd, ...args);
-    } else bargs.push(guestCmd, ...args);
-  } else bargs.push(guestCmd, ...args);
+    } else { commandOffset = bargs.length; bargs.push(guestCmd, ...args); }
+  } else { commandOffset = bargs.length; bargs.push(guestCmd, ...args); }
   return { executable: bwrap, args: bargs, env, command: guestCmd, workDir: guestCwd, mode, network: !!network, display,
-    secretArgs: secretEnvArgs.length ? Buffer.from(`${secretEnvArgs.join('\0')}\0`) : null };
+    commandOffset, secretArgs: secretEnvArgs.length ? Buffer.from(`${secretEnvArgs.join('\0')}\0`) : null };
 }
 function launchSandbox(config, options = {}) {
-  const spec = config.executable && Array.isArray(config.args) ? config : buildSandbox(config);
+  const spec = config.executable && Array.isArray(config.args) ? { ...config, args: [...config.args] } : buildSandbox(config);
+  const trackSetup = options.trackSetup === true;
+  if (trackSetup) {
+    if (!Number.isInteger(spec.commandOffset) || spec.commandOffset < 0 || spec.commandOffset >= spec.args.length) throw new Error('sandbox readiness tracking needs a generated command offset');
+    const command = spec.args.slice(spec.commandOffset);
+    if (!command.length) throw new Error('sandbox guest command is missing');
+    spec.args.splice(spec.commandOffset, command.length, '/bin/sh', '-c', 'printf "READY\\n" >&4; exec 4>&-; exec "$@"', 'portable-sandbox-ready', ...command);
+  }
   const proxies = [];
   for (const target of spec.display?.targets || []) {
     const local = path.join(spec.display.displayRoot, target.name);
@@ -306,12 +325,16 @@ function launchSandbox(config, options = {}) {
     proxies.push(server);
   }
   let stdio = options.stdio || 'inherit';
-  if (spec.secretArgs) {
+  if (spec.secretArgs || trackSetup) {
     if (Array.isArray(stdio)) {
       stdio = [...stdio];
       while (stdio.length < 3) stdio.push('inherit');
-      stdio[3] = 'pipe';
-    } else stdio = [stdio, stdio, stdio, 'pipe'];
+      if (spec.secretArgs) stdio[3] = 'pipe';
+      if (trackSetup) stdio[4] = 'pipe';
+    } else {
+      const inherited = stdio;
+      stdio = [inherited, inherited, inherited, spec.secretArgs ? 'pipe' : 'ignore', trackSetup ? 'pipe' : 'ignore'];
+    }
   }
   const child = spawn(spec.executable, spec.args, { cwd: path.dirname(spec.executable), env: spec.env, stdio, detached: true });
   if (spec.secretArgs) {
@@ -321,6 +344,39 @@ function launchSandbox(config, options = {}) {
       pipe.once('error', () => bytes.fill(0));
       pipe.end(bytes, () => bytes.fill(0));
     } else bytes.fill(0);
+  }
+  if (trackSetup) {
+    let readyResolve; let readyReject; let settled = false; let buffered = '';
+    const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+    // The caller may only care about child exit. Mark the rejection observed
+    // immediately while leaving the original promise available to await.
+    ready.catch(() => {});
+    const fd = child.stdio?.[4];
+    const timer = setTimeout(() => finish(new Error('sandbox namespace setup readiness timed out')), options.readyTimeout || 20000);
+    timer.unref?.();
+    const finish = error => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (error) readyReject(error); else readyResolve();
+    };
+    if (!fd) finish(new Error('sandbox readiness pipe was not created'));
+    else {
+      fd.setEncoding('utf8');
+      fd.on('data', chunk => {
+        buffered += chunk;
+        if (buffered.length > 128) return finish(new Error('sandbox readiness marker exceeded its limit'));
+        const at = buffered.indexOf('READY\n');
+        if (at !== -1) {
+          if (at !== 0) return finish(new Error('unexpected data on sandbox readiness pipe'));
+          finish();
+        }
+      });
+      fd.once('error', error => finish(error));
+      fd.once('end', () => { if (!settled) finish(new Error('sandbox exited before namespace setup completed')); });
+    }
+    child.once('exit', (code, signal) => { if (!settled) finish(new Error(`sandbox exited before namespace setup completed (${code ?? signal})`)); });
+    child.once('error', error => { if (!settled) finish(error); });
+    child.sandboxReady = ready;
   }
   child.displayProxies = proxies;
   const closeProxies = () => {
@@ -335,4 +391,4 @@ function launchSandbox(config, options = {}) {
   return child;
 }
 
-module.exports = { buildSandbox, launchSandbox };
+module.exports = { buildSandbox, launchSandbox, sandboxExecEnv };

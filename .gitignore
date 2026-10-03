@@ -172,6 +172,10 @@
 !/scripts/linux-sandbox.cjs
 !/scripts/linux-session.cjs
 !/scripts/linux-native-proxy.cjs
+!/scripts/linux-userns.cjs
+!/scripts/test-linux-userns.cjs
+!/scripts/test-linux-userns-privileged.cjs
+!/scripts/test-linux-bootstrap-userns.cjs
 !/scripts/test-linux-native-proxy.cjs
 !/scripts/test-linux-portable-integration.cjs
 !/scripts/test-linux-encrypted-store.cjs

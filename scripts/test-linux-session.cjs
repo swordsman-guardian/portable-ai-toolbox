@@ -7,9 +7,12 @@ const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
+const { EventEmitter } = require('node:events');
 const store = require('./linux-encrypted-store.cjs');
 const ui = require('./linux-session.cjs');
 const nativeProxy = require('./linux-native-proxy.cjs');
+const runtimeApi = require('./linux-runtime.cjs');
+let usernsApi = null; try { usernsApi = require('./linux-userns.cjs'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
 const testSessions = new Set();
 const createPrivateSession = ui.createPrivateSession.bind(ui);
 ui.createPrivateSession = async (...args) => { const record = await createPrivateSession(...args); testSessions.add(record); return record; };
@@ -44,14 +47,197 @@ async function run() {
     opened.close();
     if (process.platform === 'linux' && fs.existsSync('/usr/bin/script')) await testFirstLaunchPty();
 
+    if (process.platform === 'linux' && usernsApi) {
+      const oldStage = runtimeApi.stageRuntime, oldEnsure = usernsApi.ensureSandboxUserns, oldRelease = usernsApi.releaseSandboxUserns;
+      const released = [];
+      runtimeApi.stageRuntime = async (_root, sessionRoot) => ({ sessionRoot, bwrap: '/synthetic/bwrap' });
+      usernsApi.ensureSandboxUserns = async (runtime) => { assert.equal(runtime.bwrap, '/synthetic/bwrap'); return { fixed: true, authorization: { synthetic: `auth-${released.length}` } }; };
+      usernsApi.releaseSandboxUserns = async (authorization) => { released.push(authorization); };
+      try {
+        const revisionBefore = store.storeStatus(root).currentRevision;
+        await assert.rejects(ui.runCcSwitch(root, false), /TTY|password/i, 'synthetic noninteractive unlock should refuse after the capability grant');
+        assert.equal(store.storeStatus(root).currentRevision, revisionBefore, 'prelaunch refusal must leave the encrypted revision untouched');
+        assert.equal(ui.sessionCount(), 0, 'prelaunch refusal must release its session record');
+        await assert.rejects(ui.runCcSwitch(root, false), /TTY|password/i, 'the same menu process should be able to reacquire after refusal cleanup');
+        assert.equal(released.length, 2, 'each prelaunch failure must release its ephemeral AppArmor authorization');
+        assert.equal(store.storeStatus(root).currentRevision, revisionBefore);
+      } finally {
+        runtimeApi.stageRuntime = oldStage; usernsApi.ensureSandboxUserns = oldEnsure; usernsApi.releaseSandboxUserns = oldRelease;
+      }
+
+      const stopped = await ui.createPrivateSession(root, 'cc-switch'); stopped.discard = true;
+      const owned = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+      await once(owned, 'spawn'); stopped.children.add(owned);
+      let brokerCloseCount = 0, releaseOnStopFailure = 0;
+      const stopBroker = { server: { close() { brokerCloseCount++; } }, socket: path.join(stopped.dir, 'missing.sock'), locator: path.join(stopped.dir, 'missing.json') };
+      const stopAuthorization = { synthetic: 'stop-error' };
+      stopped.broker = stopBroker; stopped.usernsAuthorization = stopAuthorization;
+      const oldReleaseForStop = usernsApi.releaseSandboxUserns, oldKill = process.kill;
+      usernsApi.releaseSandboxUserns = async () => { releaseOnStopFailure++; };
+      process.kill = (pid, signal) => {
+        if (pid === -owned.pid && signal === 'SIGTERM') { const error = new Error('synthetic owned-process stop failure'); error.code = 'EPERM'; throw error; }
+        return oldKill(pid, signal);
+      };
+      try { await ui.saveAndRemove(stopped); }
+      finally { process.kill = oldKill; usernsApi.releaseSandboxUserns = oldReleaseForStop; }
+      assert.equal(stopped.closed, false, 'failed process shutdown leaves cleanup retryable');
+      assert.equal(stopped.broker, stopBroker, 'failed process shutdown must retain the provider broker');
+      assert.equal(brokerCloseCount, 0, 'failed process shutdown must not close the broker');
+      assert.equal(stopped.usernsAuthorization, stopAuthorization, 'failed process shutdown must retain the AppArmor authorization');
+      assert.equal(releaseOnStopFailure, 0, 'failed process shutdown must not attempt policy release');
+      assert.equal(fs.existsSync(stopped.dir), true, 'failed process shutdown must keep its private files');
+      try { oldKill(-owned.pid, 'SIGTERM'); } catch {}
+      await Promise.race([once(owned, 'exit'), new Promise((resolve) => setTimeout(resolve, 2000))]);
+      stopped.children.clear(); stopped.broker = null;
+      usernsApi.releaseSandboxUserns = async () => {};
+      await ui.saveAndRemove(stopped);
+      usernsApi.releaseSandboxUserns = oldReleaseForStop;
+      assert.equal(stopped.cleaned, true, 'a later cleanup retry should remove the stopped discard session');
+
+      const releaseFailure = await ui.createPrivateSession(root, 'cc-switch');
+      releaseFailure.opened = store.openStore(root, password);
+      releaseFailure.writerLease = ui.acquireWriterLease(root);
+      releaseFailure.originalSnapshot = store.readSnapshot(releaseFailure.opened);
+      store.restoreSnapshot(releaseFailure.originalSnapshot, releaseFailure.dir);
+      releaseFailure.usernsAuthorization = { synthetic: 'unload-retry' };
+      const edited = path.join(releaseFailure.dir, 'config/cc-switch/home/.cc-switch/settings.json');
+      fs.mkdirSync(path.dirname(edited), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(edited, '{"synthetic":"preserved-until-encrypted"}', { mode: 0o600 });
+      const revisionBeforeUnloadFailure = store.storeStatus(root).currentRevision;
+      let unloadAttempts = 0, cleanupWarning = '';
+      const oldReleaseForFailure = usernsApi.releaseSandboxUserns, oldError = console.error;
+      usernsApi.releaseSandboxUserns = async () => { if (++unloadAttempts === 1) throw new Error('run: sudo apparmor_parser -K -R synthetic-profile'); };
+      console.error = (message) => { cleanupWarning += `${message}\n`; };
+      try { await ui.saveAndRemove(releaseFailure); }
+      finally { console.error = oldError; }
+      assert.equal(releaseFailure.closed, false, 'unconfirmed profile removal must leave cleanup incomplete');
+      assert.equal(releaseFailure.cleaned, undefined, 'unconfirmed profile removal must not claim cleanup');
+      assert.equal(releaseFailure.usernsAuthorization.synthetic, 'unload-retry', 'the authorization handle must be retained after release failure');
+      assert.equal(fs.existsSync(releaseFailure.dir), true, 'release failure must retain the private session directory');
+      assert.equal(fs.readFileSync(edited, 'utf8'), '{"synthetic":"preserved-until-encrypted"}', 'edited plaintext must survive a failed release until encrypted');
+      assert.equal(store.storeStatus(root).currentRevision, revisionBeforeUnloadFailure, 'failed policy release must not partially commit an encrypted snapshot');
+      assert.match(cleanupWarning, /sudo apparmor_parser -K -R synthetic-profile/, 'cleanup failure must expose its manual profile removal command');
+      usernsApi.releaseSandboxUserns = async () => {};
+      assert.equal(await ui.lockActiveManager(root), true, 'the public CC Switch lock action should retry a retained same-root cleanup before broker lookup');
+      usernsApi.releaseSandboxUserns = oldReleaseForFailure;
+      assert.equal(releaseFailure.cleaned, true, 'cleanup can be retried after policy removal succeeds');
+      const savedAfterRetry = store.openStore(root, password);
+      assert.equal(store.readSnapshot(savedAfterRetry).get('config/cc-switch/home/.cc-switch/settings.json').toString(), '{"synthetic":"preserved-until-encrypted"}',
+        'retry must encrypt edits before removing their private plaintext source');
+      savedAfterRetry.close();
+
+      const oldStageAfterGateFailure = runtimeApi.stageRuntime, oldEnsureAfterGateFailure = usernsApi.ensureSandboxUserns;
+      const oldReleaseAfterGateFailure = usernsApi.releaseSandboxUserns;
+      runtimeApi.stageRuntime = async (_root, sessionRoot) => ({ sessionRoot, bwrap: '/synthetic/bwrap' });
+      let partialAuthorization = null, partialSessionRoot = null;
+      usernsApi.ensureSandboxUserns = async (runtime) => {
+        const marker = path.join(runtime.sessionRoot, '.apparmor-cleanup-unconfirmed');
+        fs.writeFileSync(marker, 'synthetic uncertainty', { mode: 0o600, flag: 'wx' });
+        partialSessionRoot = runtime.sessionRoot;
+        partialAuthorization = { profile: { name: '' }, sessionRoot: runtime.sessionRoot };
+        const error = new Error('synthetic setup failed after authorization');
+        error.usernsAuthorization = partialAuthorization;
+        throw error;
+      };
+      let partialReleaseAttempts = 0;
+      usernsApi.releaseSandboxUserns = async (authorization) => {
+        assert.equal(authorization, partialAuthorization);
+        assert.equal(authorization.profile.name, '');
+        if (++partialReleaseAttempts === 1) throw new Error('synthetic partial authorization unload failure');
+        fs.unlinkSync(path.join(authorization.sessionRoot, '.apparmor-cleanup-unconfirmed'));
+      };
+      const revisionBeforePartialGate = store.storeStatus(root).currentRevision;
+      try {
+        await assert.rejects(ui.runCcSwitch(root, false), /synthetic setup failed after authorization/);
+        assert.ok(partialAuthorization, 'failed ensure cleanup must preserve its partial authorization handle');
+        assert.ok(partialSessionRoot, 'failed ensure cleanup must retain the private profile attachment path');
+        assert.equal(fs.existsSync(path.join(partialSessionRoot, '.apparmor-cleanup-unconfirmed')), true, 'uncertain helper cleanup marker must remain in the private tree');
+        assert.equal(fs.existsSync(partialSessionRoot), true, 'the profile attachment path must remain private and present');
+        assert.equal(store.storeStatus(root).currentRevision, revisionBeforePartialGate, 'partial gate cleanup must not mutate encrypted data');
+        assert.equal(await ui.lockActiveManager(root), true, 'same-root lock must retry a partial ensure authorization before opening the broker locator');
+        assert.equal(fs.existsSync(partialSessionRoot), false, 'confirmed retry should remove the retained preflight directory');
+        assert.equal(store.storeStatus(root).currentRevision, revisionBeforePartialGate);
+
+        const noHandle = await ui.createPrivateSession(root, 'cc-switch'); noHandle.discard = true;
+        noHandle.usernsCleanupUncertain = true; noHandle.authorizationCleanupError = new Error('synthetic marker without authorization');
+        fs.writeFileSync(path.join(noHandle.dir, '.apparmor-cleanup-unconfirmed'), 'synthetic marker', { mode: 0o600 });
+        await ui.saveAndRemove(noHandle);
+        assert.equal(noHandle.cleaned, undefined, 'a marker without a matching authorization must never be treated as released');
+        assert.equal(fs.existsSync(noHandle.dir), true, 'marker-without-handle cleanup must retain the profile attachment tree');
+        await assert.rejects(ui.lockActiveManager(root), /清理仍未完成/, 'the public lock action must expose unresolved marker cleanup');
+        fs.unlinkSync(path.join(noHandle.dir, '.apparmor-cleanup-unconfirmed'));
+        noHandle.usernsCleanupUncertain = false; noHandle.authorizationCleanupError = null;
+        await ui.saveAndRemove(noHandle);
+        assert.equal(noHandle.cleaned, true, 'synthetic suite cleanup removes its marker after uncertainty is cleared');
+
+        const manuallyRemoved = await ui.createPrivateSession(root, 'cc-switch'); manuallyRemoved.discard = true;
+        const exactProfile = 'portable-ai-bwrap-4242-0123456789ab';
+        manuallyRemoved.usernsAuthorization = { profile: { name: exactProfile } };
+        fs.writeFileSync(path.join(manuallyRemoved.dir, '.apparmor-cleanup-unconfirmed'), 'synthetic marker', { mode: 0o600 });
+        const oldReadFileSync = fs.readFileSync, oldManualRelease = usernsApi.releaseSandboxUserns;
+        usernsApi.releaseSandboxUserns = async () => { throw new Error('manual unload was needed'); };
+        fs.readFileSync = function (file, ...args) {
+          if (file === '/sys/kernel/security/apparmor/profiles') return 'unrelated-profile (enforce)\n';
+          return oldReadFileSync.call(this, file, ...args);
+        };
+        try { await ui.saveAndRemove(manuallyRemoved); }
+        finally { fs.readFileSync = oldReadFileSync; usernsApi.releaseSandboxUserns = oldManualRelease; }
+        assert.equal(manuallyRemoved.cleaned, true, 'a read-only exact-profile absence check should confirm manual unload');
+        assert.equal(fs.existsSync(manuallyRemoved.dir), false, 'confirmed unload permits removing the uncertainty marker and private tree');
+      } finally {
+        runtimeApi.stageRuntime = oldStageAfterGateFailure;
+        usernsApi.ensureSandboxUserns = oldEnsureAfterGateFailure;
+        usernsApi.releaseSandboxUserns = oldReleaseAfterGateFailure;
+      }
+    }
+
     const restoreLifecycle = await ui.createPrivateSession(root, 'claude');
     restoreLifecycle.opened = store.openStore(root, password);
+    let normalRelease = 0;
+    const originalRelease = usernsApi?.releaseSandboxUserns;
+    if (usernsApi) { usernsApi.releaseSandboxUserns = async (authorization) => { assert.equal(authorization.synthetic, 'normal-cleanup'); normalRelease++; }; restoreLifecycle.usernsAuthorization = { synthetic: 'normal-cleanup' }; }
     assert.equal(fs.existsSync(path.join(restoreLifecycle.dir, '.portable-session.json')), false, 'empty private session must not block canonical snapshot restore');
     store.restoreSnapshot(store.readSnapshot(restoreLifecycle.opened), restoreLifecycle.dir);
     ui.writePrivateOwner(restoreLifecycle);
     assert.equal(fs.existsSync(path.join(restoreLifecycle.dir, '.portable-session.json')), true, 'crash metadata is written after snapshot restore');
     await Promise.all([ui.saveAndRemove(restoreLifecycle), ui.saveAndRemove(restoreLifecycle)]);
+    if (usernsApi) { usernsApi.releaseSandboxUserns = originalRelease; assert.equal(normalRelease, 1, 'normal close must release its user namespace authorization exactly once'); }
     assert.equal(ui.sessionCount(), 0, 'completed cleanup must remove the session from the process-owned session map');
+
+    const setupFailure = { discard: true }, failedChild = new EventEmitter(); failedChild.exitCode = null; failedChild.signalCode = null; failedChild.sandboxReady = Promise.reject(new Error('synthetic namespace setup failure'));
+    await assert.rejects(ui.awaitSandboxReady(setupFailure, failedChild), /synthetic namespace setup failure/);
+    assert.equal(setupFailure.discard, true, 'a failed namespace setup must stay on the discard path');
+    const launched = { discard: true }, appChild = new EventEmitter(); appChild.exitCode = null; appChild.signalCode = null; appChild.sandboxReady = Promise.resolve();
+    await ui.awaitSandboxReady(launched, appChild);
+    assert.equal(launched.discard, false, 'session data becomes saveable only after namespace setup readiness');
+    setImmediate(() => { appChild.exitCode = 7; appChild.emit('exit', 7, null); });
+    assert.deepEqual(await ui.waitForChild(appChild), { code: 7, signal: null }, 'a nonzero application exit remains a launched session that can be archived');
+    assert.equal(launched.discard, false, 'a nonzero application exit must not turn a ready session back into a prelaunch discard');
+
+    const stagedRestore = await ui.createPrivateSession(root, 'cc-switch'); stagedRestore.discard = true;
+    for (const rel of ['harness/cc-switch/claude', 'config/cc-switch/home/.cc-switch']) fs.mkdirSync(path.join(stagedRestore.dir, rel), { recursive: true, mode: 0o700 });
+    const restoreFiles = new Map([
+      ['harness/cc-switch/claude/settings.json', Buffer.from('{"synthetic":true}')],
+      ['config/cc-switch/home/.cc-switch/settings.json', Buffer.from('{"synthetic":true}')],
+    ]);
+    await ui.restoreSessionSnapshot(restoreFiles, stagedRestore);
+    const stagedSettings = path.join(stagedRestore.dir, 'harness/cc-switch/claude/settings.json');
+    assert.equal(fs.readFileSync(stagedSettings, 'utf8'), '{"synthetic":true}');
+    assert.equal(fs.statSync(stagedSettings).mode & 0o777, 0o600, 'restored files should be private');
+    assert.equal(fs.readdirSync(stagedRestore.dir).some((n) => n.startsWith('.snapshot-validate-')), false, 'temporary plaintext snapshot must always be removed');
+    await assert.rejects(ui.restoreSessionSnapshot(restoreFiles, stagedRestore), /EEXIST|already exists|unsafe/i, 'staged restore must refuse to overwrite a file');
+    assert.equal(fs.readdirSync(stagedRestore.dir).some((n) => n.startsWith('.snapshot-validate-')), false, 'failed restores must also remove temporary plaintext');
+    await assert.rejects(ui.restoreSessionSnapshot(new Map([['../escape.json', Buffer.from('bad')]]), stagedRestore), /unsafe|invalid|relative|path/i, 'restore must reject traversal before copying');
+    await ui.saveAndRemove(stagedRestore);
+
+    if (process.platform === 'linux') {
+      const symlinkRestore = await ui.createPrivateSession(root, 'cc-switch'); symlinkRestore.discard = true;
+      const configRoot = path.join(symlinkRestore.dir, 'harness/cc-switch'); fs.mkdirSync(configRoot, { recursive: true });
+      fs.symlinkSync(os.tmpdir(), path.join(configRoot, 'claude'));
+      await assert.rejects(ui.restoreSessionSnapshot(new Map([['harness/cc-switch/claude/settings.json', Buffer.from('{}')]]), symlinkRestore), /symbolic link|unsafe|EEXIST/i,
+        'restore must reject symlinked staged directories');
+      await ui.saveAndRemove(symlinkRestore);
+    }
 
     const a = await ui.createPrivateSession(root); a.opened = store.openStore(root, password);
     const b = await ui.createPrivateSession(root); b.opened = store.openStore(root, password);
@@ -234,10 +420,14 @@ async function run() {
     const ccChild = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
     await new Promise((resolve, reject) => { ccChild.once('spawn', resolve); ccChild.once('error', reject); });
     ccUnplug.managerChild = ccChild; ccUnplug.children.add(ccChild);
+    let unplugRelease = 0;
+    const originalUnplugRelease = usernsApi?.releaseSandboxUserns;
+    if (usernsApi) { usernsApi.releaseSandboxUserns = async (authorization) => { assert.equal(authorization.synthetic, 'unplug-cleanup'); unplugRelease++; }; ccUnplug.usernsAuthorization = { synthetic: 'unplug-cleanup' }; }
     ui.watchForUnplug(ccUnplug, 'CC Switch');
     ccUnplug.identity.mountId = 'synthetic-cc-remount-change';
     const unplugDeadline = Date.now() + 6000;
     while (!ccUnplug.cleaned && Date.now() < unplugDeadline) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (usernsApi) { usernsApi.releaseSandboxUserns = originalUnplugRelease; assert.equal(unplugRelease, 1, 'unplug cleanup must release its user namespace authorization'); }
     assert.equal(ccUnplug.cleaned, true, 'CC Switch unplug watcher must stop its owned GUI and encrypt/remove its private session');
     assert.equal(ccChild.exitCode !== null || ccChild.signalCode !== null, true, 'CC Switch unplug cleanup must wait for the owned process to stop');
     const ccRecoveryDir = path.join(os.tmpdir(), `portable-ai-${process.getuid ? process.getuid() : 'user'}`, 'recovery');
@@ -248,7 +438,8 @@ async function run() {
     const hupState = path.join(root, 'hup-state.json');
     const modulePath = path.resolve(__dirname, 'linux-session.cjs');
     const storePath = path.resolve(__dirname, 'linux-encrypted-store.cjs');
-    const hupScript = `const fs=require('node:fs'),path=require('node:path'),{spawn}=require('node:child_process'),ui=require(${JSON.stringify(modulePath)}),store=require(${JSON.stringify(storePath)});(async()=>{const root=process.argv[1],password=process.argv[2],state=process.argv[3],r=await ui.createPrivateSession(root,'claude');r.opened=store.openStore(root,password);r.workHash='${'e'.repeat(64)}';r.claudeConfigDir=path.join(r.dir,'harness','cc-switch','claude');const f=path.join(r.claudeConfigDir,'projects','hup.jsonl');fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,'hup-cleanup-sentinel');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await new Promise((ok,bad)=>{c.once('spawn',ok);c.once('error',bad)});r.children.add(c);r.managerChild=c;fs.writeFileSync(state,JSON.stringify({dir:r.dir,pid:c.pid}));ui.installExitHandlers();setTimeout(()=>process.kill(process.pid,'SIGHUP'),100)})().catch(e=>{console.error(e);process.exit(2)})`;
+    const usernsPath = path.resolve(__dirname, 'linux-userns.cjs');
+    const hupScript = `const fs=require('node:fs'),path=require('node:path'),{spawn}=require('node:child_process'),ui=require(${JSON.stringify(modulePath)}),store=require(${JSON.stringify(storePath)}),userns=require(${JSON.stringify(usernsPath)});userns.releaseSandboxUserns=async()=>{const x=JSON.parse(fs.readFileSync(process.argv[3],'utf8'));x.usernsReleased=true;fs.writeFileSync(process.argv[3],JSON.stringify(x))};(async()=>{const root=process.argv[1],password=process.argv[2],state=process.argv[3],r=await ui.createPrivateSession(root,'claude');r.opened=store.openStore(root,password);r.usernsAuthorization={synthetic:'hup'};r.workHash='${'e'.repeat(64)}';r.claudeConfigDir=path.join(r.dir,'harness','cc-switch','claude');const f=path.join(r.claudeConfigDir,'projects','hup.jsonl');fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,'hup-cleanup-sentinel');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await new Promise((ok,bad)=>{c.once('spawn',ok);c.once('error',bad)});r.children.add(c);r.managerChild=c;fs.writeFileSync(state,JSON.stringify({dir:r.dir,pid:c.pid,usernsReleased:false}));ui.installExitHandlers();setTimeout(()=>process.kill(process.pid,'SIGHUP'),100)})().catch(e=>{console.error(e);process.exit(2)})`;
     const hupWorker = spawn(process.execPath, ['-e', hupScript, root, password, hupState], { stdio: 'ignore' });
     let hupTimer;
     const hupExit = await Promise.race([
@@ -258,6 +449,7 @@ async function run() {
     clearTimeout(hupTimer);
     assert.equal(hupExit[0], 129, 'SIGHUP must await owned cleanup before exiting with its conventional status');
     const hup = JSON.parse(fs.readFileSync(hupState, 'utf8'));
+    assert.equal(hup.usernsReleased, true, 'SIGHUP cleanup must release its user namespace authorization');
     assert.equal(fs.existsSync(hup.dir), false, 'SIGHUP cleanup must remove the private plaintext session after archive');
     assert.throws(() => process.kill(hup.pid, 0), (error) => error.code === 'ESRCH', 'SIGHUP cleanup must stop the owned process group');
 
@@ -324,7 +516,8 @@ async function testFirstLaunchPty() {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-linux-pty-first-run-'));
   const scripts = path.join(fixture, 'scripts'), project = path.join(fixture, 'project'), tmp = path.join(fixture, 'tmp');
   fs.mkdirSync(scripts, { mode: 0o700 }); fs.mkdirSync(project, { mode: 0o700 }); fs.mkdirSync(tmp, { mode: 0o700 });
-  for (const name of ['ai.cjs', 'linux-session.cjs', 'linux-encrypted-store.cjs', 'linux-runtime.cjs', 'linux-sandbox.cjs', 'linux-native-proxy.cjs']) {
+  for (const name of ['ai.cjs', 'linux-session.cjs', 'linux-encrypted-store.cjs', 'linux-runtime.cjs', 'linux-sandbox.cjs', 'linux-native-proxy.cjs', 'linux-userns.cjs']) {
+    if (!fs.existsSync(path.join(__dirname, name))) continue;
     fs.copyFileSync(path.join(__dirname, name), path.join(scripts, name));
   }
   const quote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -344,15 +537,26 @@ async function testFirstLaunchPty() {
   };
   try {
     await waitFor('请选择：'); child.stdin.write('6\n');
-    await waitFor('设置主密码: '); child.stdin.write('synthetic-pty-password\n');
-    await waitFor('再次输入主密码: '); child.stdin.write('synthetic-pty-password\n');
     await waitFor('portable Linux runtime is incomplete');
     await waitFor('请选择：'); child.stdin.write('0\n');
     const [code] = await Promise.race([once(child, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('PTY first-run CLI did not exit')), 8000))]);
     assert.equal(code, 0, `first-run CLI failed: ${output}`);
     assert.equal(output.includes('synthetic-pty-password'), false, 'masked master password must never appear in terminal output');
-    assert.equal(store.storeStatus(fixture).state, 'Locked', 'PTY first-run settings must create a recoverable encrypted vault despite missing assets');
-    console.log('Synthetic TTY first-run password and private vault creation passed.');
+    assert.equal(store.storeStatus(fixture).state, 'Absent', 'runtime refusal must happen before a first-run master password can create a vault');
+
+    // Keep a real masked-password TTY check, separated from first-run settings
+    // so it cannot create a vault merely to exercise the input widget.
+    const probe = spawn('/usr/bin/script', ['-qec', `${quote(process.execPath)} -e ${quote(`require(${JSON.stringify(path.join(scripts, 'linux-session.cjs'))}).askSecret('Synthetic password probe').then(()=>process.exit(0),()=>process.exit(1))`)}`, '/dev/null'], {
+      cwd: project, env: { PATH: '/usr/bin:/bin', HOME: fixture, TMPDIR: tmp, TERM: 'xterm', LANG: 'C.UTF-8' }, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let probeOutput = '';
+    probe.stdout.on('data', (b) => { probeOutput += b.toString(); }); probe.stderr.on('data', (b) => { probeOutput += b.toString(); });
+    await new Promise((resolve, reject) => { probe.once('error', reject); probe.once('spawn', resolve); });
+    await new Promise((resolve) => setTimeout(resolve, 100)); probe.stdin.write('synthetic-pty-password\n');
+    const [probeCode] = await once(probe, 'exit');
+    assert.equal(probeCode, 0, 'TTY password input should still work');
+    assert.equal(probeOutput.includes('synthetic-pty-password'), false, 'masked password probe must not echo the typed secret');
+    console.log('Synthetic TTY preflight refusal and masked password checks passed.');
   } finally {
     if (child.exitCode === null) { child.kill('SIGTERM'); await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 1000))]); }
     fs.rmSync(fixture, { recursive: true, force: true });

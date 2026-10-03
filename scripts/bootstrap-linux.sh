@@ -12,21 +12,82 @@ if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then echo 'Supported boo
 if [[ ! -r /etc/os-release ]]; then echo 'Unsupported packaging host: use Ubuntu 24.04 x86_64 to build the Linux runtime.' >&2; exit 2; fi
 . /etc/os-release
 if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 24.04 ]]; then echo 'Unsupported packaging host: use Ubuntu 24.04 x86_64 to build the Linux runtime.' >&2; exit 2; fi
-if (($# != 1)); then echo 'Usage: bootstrap-linux.sh /path/to/portable-root' >&2; exit 2; fi
-ROOT=$(realpath -e -- "$1")
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+GUARD_PID=
+cleanup() {
+  if [[ -n ${GUARD_PID:-} ]]; then
+    kill -TERM "$GUARD_PID" 2>/dev/null || true
+    wait "$GUARD_PID" 2>/dev/null || true
+    GUARD_PID=
+  fi
+  if [[ -e $WORK/.apparmor-cleanup-unconfirmed || -L $WORK/.apparmor-cleanup-unconfirmed ]]; then
+    echo "AppArmor cleanup could not be confirmed; retained private bootstrap workspace for recovery: $WORK" >&2
+    return
+  fi
+  rm -rf -- "$WORK"
+}
+handle_guard_signal() {
+  local signal=$1 status=143
+  case $signal in INT) status=130 ;; HUP) status=129 ;; esac
+  trap '' INT TERM HUP
+  if [[ -n ${GUARD_PID:-} ]]; then
+    kill -s "$signal" "$GUARD_PID" 2>/dev/null || true
+    wait "$GUARD_PID" 2>/dev/null || true
+    GUARD_PID=
+  fi
+  exit "$status"
+}
+MODE=prepare
+if (($# == 3)) && [[ $1 == --continue ]]; then
+  MODE=continue
+  ROOT_ARG=$2
+  WORK_ARG=$3
+elif (($# == 1)); then
+  ROOT_ARG=$1
+else
+  echo 'Usage: bootstrap-linux.sh /path/to/portable-root' >&2
+  exit 2
+fi
+ROOT=$(realpath -e -- "$ROOT_ARG")
 [[ -d $ROOT ]] || { echo 'Portable root must be an existing directory.' >&2; exit 2; }
 for c in curl tar apt-get dpkg-deb ldd; do command -v "$c" >/dev/null || { echo "Missing host bootstrap utility: $c" >&2; exit 2; }; done
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/aistick-linux-bootstrap.XXXXXXXX")
-cleanup() { rm -rf -- "$WORK"; }
-trap cleanup EXIT INT TERM
+if [[ $MODE == prepare ]]; then
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/aistick-linux-bootstrap.XXXXXXXX")
+  chmod 700 -- "$WORK"
+  trap cleanup EXIT
+  trap 'handle_guard_signal INT' INT
+  trap 'handle_guard_signal TERM' TERM
+  trap 'handle_guard_signal HUP' HUP
+else
+  WORK=$WORK_ARG
+  [[ -d $WORK && $(realpath -e -- "$WORK") == "$WORK" ]] || { echo 'Rejected continuation: WORK must be an existing canonical directory.' >&2; exit 2; }
+  [[ $(basename -- "$WORK") == aistick-linux-bootstrap.* ]] || { echo 'Rejected continuation: WORK path is not an owned bootstrap workspace.' >&2; exit 2; }
+  [[ $(stat -c '%u:%a' -- "$WORK") == "$(id -u):700" ]] || { echo 'Rejected continuation: WORK must be owned by the current user with mode 0700.' >&2; exit 2; }
+  [[ ${AISTICK_USERNS_GUARD_PID:-} =~ ^[1-9][0-9]*$ && ${AISTICK_USERNS_GUARD_PID} == "$PPID" && -r /proc/$PPID/cmdline ]] || { echo 'Rejected continuation: bootstrap must be handed off by the live AppArmor userns guard.' >&2; exit 2; }
+  local_guard_cmd=()
+  mapfile -d '' -t local_guard_cmd < "/proc/$PPID/cmdline"
+  expected_runtime_json=$(printf '{"sessionRoot":"%s","runtimeRoot":"%s","sandboxRoot":"%s","bwrap":"%s"}' "$WORK" "$WORK" "$WORK/bwrap" "$WORK/bwrap/root/usr/bin/bwrap")
+  [[ ${#local_guard_cmd[@]} -eq 10 \
+    && ${local_guard_cmd[0]} == "$WORK/node/bin/node" \
+    && ${local_guard_cmd[0]} == "$(readlink -f -- "/proc/$PPID/exe")" \
+    && ${local_guard_cmd[1]} == "$SCRIPT_DIR/linux-userns.cjs" \
+    && ${local_guard_cmd[2]} == --guard-command \
+    && ${local_guard_cmd[3]} == "$expected_runtime_json" \
+    && ${local_guard_cmd[4]} == -- \
+    && ${local_guard_cmd[5]} == bash \
+    && ${local_guard_cmd[6]} == "$SCRIPT_DIR/bootstrap-linux.sh" \
+    && ${local_guard_cmd[7]} == --continue \
+    && ${local_guard_cmd[8]} == "$ROOT" \
+    && ${local_guard_cmd[9]} == "$WORK" ]] || { echo 'Rejected continuation: live guard command line does not match this bootstrap workspace.' >&2; exit 2; }
+  [[ -x $WORK/node/bin/node && -x $WORK/bwrap/root/usr/bin/bwrap && -f $WORK/bwrap-runtime-ready ]] || { echo 'Rejected continuation: verified Node and bubblewrap preparation is incomplete.' >&2; exit 2; }
+fi
 mkdir -p "$WORK/download-home"
 safe_curl() { env -i PATH="$PATH" HOME="$WORK/download-home" /usr/bin/curl "$@"; }
 RT="$ROOT/runtime/linux-x64"; TOOLS="$ROOT/tools/linux-x64"; NPM="$ROOT/npm-global/linux-x64"
-mkdir -p -- "$RT" "$TOOLS" "$NPM"
 NODE_VER=22.23.3
 UV_VER=0.8.22
 CC_VER=3.20.4
-
+NODE_FILE="node-v${NODE_VER}-linux-x64.tar.xz"
 download_ranges() {
   local url=$1 output=$2 total=$3 chunk=4194304 start end index part size
   local parts="$WORK/ranges-$(basename "$output")"
@@ -56,9 +117,8 @@ download_ranges() {
   done
   [[ $(stat -c '%s' "$output") -eq $total ]] || { echo "Downloaded size mismatch for $url" >&2; exit 1; }
 }
-
+if [[ $MODE == prepare ]]; then
 safe_curl --fail --location --silent --show-error --retry 4 --retry-all-errors --connect-timeout 20 --max-time 120 "https://nodejs.org/dist/v${NODE_VER}/SHASUMS256.txt" -o "$WORK/node-shasums"
-NODE_FILE="node-v${NODE_VER}-linux-x64.tar.xz"
 NODE_SHA=$(awk -v f="$NODE_FILE" '$2 == f || $2 == "*" f {print $1; exit}' "$WORK/node-shasums")
 [[ $NODE_SHA =~ ^[0-9a-f]{64}$ ]] || { echo 'Node official checksum record was missing.' >&2; exit 1; }
 if [[ -f $RT/node-runtime.tar.xz ]] && echo "$NODE_SHA  $RT/node-runtime.tar.xz" | sha256sum --check --status; then
@@ -66,7 +126,6 @@ if [[ -f $RT/node-runtime.tar.xz ]] && echo "$NODE_SHA  $RT/node-runtime.tar.xz"
 else
   safe_curl --fail --location --silent --show-error --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 "https://nodejs.org/dist/v${NODE_VER}/${NODE_FILE}" -o "$WORK/$NODE_FILE"
   echo "$NODE_SHA  $WORK/$NODE_FILE" | sha256sum --check --status || { echo 'Node archive checksum mismatch.' >&2; exit 1; }
-  cp -- "$WORK/$NODE_FILE" "$RT/node-runtime.tar.xz"
 fi
 mkdir -p "$WORK/node"
 tar -xJf "$WORK/$NODE_FILE" -C "$WORK/node" --strip-components=1
@@ -82,17 +141,16 @@ if [[ -f $RT/uv-runtime.tar.gz ]] && echo "$UV_SHA  $RT/uv-runtime.tar.gz" | sha
 else
   download_ranges "https://github.com/astral-sh/uv/releases/download/${UV_VER}/uv-x86_64-unknown-linux-gnu.tar.gz" "$WORK/uv.tar.gz" "$UV_SIZE"
   echo "$UV_SHA  $WORK/uv.tar.gz" | sha256sum --check --status || { echo 'uv archive checksum mismatch.' >&2; exit 1; }
-  cp -- "$WORK/uv.tar.gz" "$RT/uv-runtime.tar.gz"
 fi
 
 CC_URL="https://github.com/farion1231/cc-switch/releases/download/v${CC_VER}/CC-Switch-v${CC_VER}-Linux-x86_64.AppImage"
 CC_SHA=c8d66d8193fd00fd12239bd06a8c50f517badbf50d9020a4662e95e907b318ef
 if [[ -f $RT/cc-switch.AppImage ]] && echo "$CC_SHA  $RT/cc-switch.AppImage" | sha256sum --check --status; then
   echo 'Using the already verified official CC Switch AppImage.'
+  cp -- "$RT/cc-switch.AppImage" "$WORK/cc-switch.AppImage"
 else
   download_ranges "$CC_URL" "$WORK/cc-switch.AppImage" 93010424
   echo "$CC_SHA  $WORK/cc-switch.AppImage" | sha256sum --check --status || { echo 'CC Switch official release checksum mismatch.' >&2; exit 1; }
-  cp -- "$WORK/cc-switch.AppImage" "$RT/cc-switch.AppImage"
 fi
 
 # Retrieve Ubuntu's published bubblewrap package without installing it. Package
@@ -109,7 +167,59 @@ while read -r lib; do
   [[ $lib = /* && -e $lib ]] || continue
   cp -L --parents -- "$lib" "$WORK/bwrap/root"
 done < <(ldd "$BW" | sed -nE 's/.*=> ([^ ]+) .*/\1/p; s/^\s*(\/[^ ]+) .*/\1/p')
-tar -C "$WORK/bwrap/root" -czf "$RT/bwrap-runtime.tar.gz" .
+tar -C "$WORK/bwrap/root" -czf "$WORK/bwrap-runtime.tar.gz" .
+touch "$WORK/bwrap-runtime-ready"
+
+# Keep the archive layout stable, while placing private copies of the staged
+# loader directories where sandboxExecEnv expects them for the host-side
+# bubblewrap executable.
+mkdir -p "$WORK/bwrap/sandbox/lib"
+for loader_dir in "$WORK/bwrap/root/lib/x86_64-linux-gnu" "$WORK/bwrap/root/lib64"; do
+  [[ -d $loader_dir && ! -L $loader_dir ]] || continue
+  rel=${loader_dir#"$WORK/bwrap/root/"}
+  mkdir -p "$WORK/bwrap/sandbox/$(dirname -- "$rel")"
+  cp -a -- "$loader_dir" "$WORK/bwrap/sandbox/$(dirname -- "$rel")/"
+done
+fi
+
+if [[ $MODE == prepare ]]; then
+  # The guard keeps the exact approved profile loaded until the continuation
+  # exits. The parent owns WORK and removes it only after guard teardown.
+  RUNTIME_JSON=$("$WORK/node/bin/node" -e 'process.stdout.write(JSON.stringify({sessionRoot:process.argv[1],runtimeRoot:process.argv[1],sandboxRoot:process.argv[2],bwrap:process.argv[3]}))' "$WORK" "$WORK/bwrap" "$WORK/bwrap/root/usr/bin/bwrap")
+  {
+    "$WORK/node/bin/node" "$SCRIPT_DIR/linux-userns.cjs" --guard-command "$RUNTIME_JSON" -- bash "$SCRIPT_DIR/bootstrap-linux.sh" --continue "$ROOT" "$WORK" <&0 &
+    GUARD_PID=$!
+  }
+  set +e
+  wait "$GUARD_PID"
+  GUARD_STATUS=$?
+  set -e
+  GUARD_PID=
+  if ((GUARD_STATUS != 0)); then
+    echo "AppArmor/user namespace authorization or guarded bootstrap continuation failed (status $GUARD_STATUS); preparation stopped." >&2
+  fi
+  exit "$GUARD_STATUS"
+fi
+
+if [[ $MODE == continue ]]; then
+  mkdir -p -- "$RT" "$TOOLS" "$NPM"
+  cp -- "$WORK/$NODE_FILE" "$RT/node-runtime.tar.xz"
+  cp -- "$WORK/uv.tar.gz" "$RT/uv-runtime.tar.gz"
+  cp -- "$WORK/cc-switch.AppImage" "$RT/cc-switch.AppImage"
+  cp -- "$WORK/bwrap-runtime.tar.gz" "$RT/bwrap-runtime.tar.gz"
+fi
+
+NODE="$WORK/node/bin/node"
+NPM_CLI="$WORK/node/lib/node_modules/npm/bin/npm-cli.js"
+BW="$WORK/bwrap/root/usr/bin/bwrap"
+BWRAP_LD_LIBRARY_PATH=$("$NODE" -e 'const {sandboxExecEnv}=require(process.argv[1]);process.stdout.write(sandboxExecEnv(process.argv[2],process.argv[3]).LD_LIBRARY_PATH||"")' "$SCRIPT_DIR/linux-sandbox.cjs" "$WORK" "$WORK/bwrap")
+bwrap_exec() {
+  if [[ -n $BWRAP_LD_LIBRARY_PATH ]]; then
+    env LD_LIBRARY_PATH="$BWRAP_LD_LIBRARY_PATH" "$BW" "$@"
+  else
+    "$BW" "$@"
+  fi
+}
 
 # Run npm's lifecycle scripts under the same user/PID/IPC/UTS namespace model
 # used by sessions. Network remains available only for this explicit package
@@ -126,7 +236,7 @@ printf 'NAME="Portable Linux Bootstrap"\nID=portable\nPRETTY_NAME="Portable Linu
 : > "$WORK/bootstrap-etc/npm-user.npmrc"
 : > "$WORK/bootstrap-etc/npm-global.npmrc"
 run_bubblewrap() {
-  "$BW" --clearenv --die-with-parent --new-session --unshare-user --unshare-pid --unshare-ipc --unshare-uts \
+  bwrap_exec --clearenv --die-with-parent --new-session --unshare-user --unshare-pid --unshare-ipc --unshare-uts \
     --uid 0 --gid 0 --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /sbin /sbin \
     --ro-bind /lib /lib --ro-bind /lib64 /lib64 --dir /etc --dir /etc/ssl --dir /etc/ssl/certs \
     --ro-bind /etc/ssl/certs /etc/ssl/certs --ro-bind /etc/fonts /etc/fonts \
@@ -197,8 +307,6 @@ CLAUDE_SLOT="slots/${CLAUDE_VER}-${CLAUDE_ARCHIVE_SHA:0:12}"
 mkdir -p "$NPM/$CLAUDE_SLOT"
 cp -- "$WORK/claude-package.tar.gz" "$NPM/$CLAUDE_SLOT/claude-package.tar.gz"
 "$NODE" -e 'const fs=require("fs");const [p,v,i,h]=process.argv.slice(1);fs.writeFileSync(p,JSON.stringify({name:"@anthropic-ai/claude-code",version:v,registryIntegrity:i,archiveSha256:h,source:"npm-registry-integrity-verified"},null,2)+"\n",{mode:0o600})' "$NPM/$CLAUDE_SLOT/manifest.json" "$CLAUDE_VER" "$CLAUDE_INTEGRITY" "$CLAUDE_ARCHIVE_SHA"
-"$NODE" -e 'const fs=require("fs");const [p,s,v,h]=process.argv.slice(1);fs.writeFileSync(p+".next",JSON.stringify({slot:s,version:v,archiveSha256:h})+"\n",{mode:0o600})' "$NPM/active.json" "$CLAUDE_SLOT" "$CLAUDE_VER" "$CLAUDE_ARCHIVE_SHA"
-mv -f -- "$NPM/active.json.next" "$NPM/active.json"
 
 # Pin and package Astral's official managed CPython 3.12.11 standalone build.
 # Using its published release digest avoids relying on a host Python, uv cache,
@@ -223,5 +331,9 @@ PYTHON_VERSION=$(env -i PATH="$PATH" HOME="$WORK/download-home" "$PYTHON_EXEC" -
 printf '{"version":"3.12.11","managedBy":"python-build-standalone 20250612","sourceSha256":"%s"}\n' "$PYTHON_SHA" > "$TOOLS/python312-manifest.json"
 
 "$NODE" -e 'const fs=require("fs"),path=require("path"),crypto=require("crypto");const [out,root,node,uv,cc]=process.argv.slice(1);const names=["runtime/linux-x64/node-runtime.tar.xz","runtime/linux-x64/uv-runtime.tar.gz","runtime/linux-x64/bwrap-runtime.tar.gz","runtime/linux-x64/cc-switch.AppImage","tools/linux-x64/python312-runtime.tar.gz","tools/linux-x64/python312-manifest.json","tools/linux-x64/git-runtime.tar.gz"];const sha256={};for(const n of names)sha256[n]=crypto.createHash("sha256").update(fs.readFileSync(path.join(root,n))).digest("hex");fs.writeFileSync(out,JSON.stringify({platform:"linux",arch:"x64",versions:{node,uv,ccSwitch:cc},sha256},null,2)+"\n")' "$RT/manifest.json" "$ROOT" "$NODE_VER" "$UV_VER" "$CC_VER"
+# Commit Claude's active package only after every managed runtime asset has
+# passed validation and the final manifest has been written successfully.
+"$NODE" -e 'const fs=require("fs");const [p,s,v,h]=process.argv.slice(1);fs.writeFileSync(p+".next",JSON.stringify({slot:s,version:v,archiveSha256:h})+"\n",{mode:0o600})' "$NPM/active.json" "$CLAUDE_SLOT" "$CLAUDE_VER" "$CLAUDE_ARCHIVE_SHA"
+mv -f -- "$NPM/active.json.next" "$NPM/active.json"
 echo "Linux x86_64 portable assets prepared at: $ROOT"
 echo "CC Switch: v$CC_VER; Node: v$NODE_VER; uv: $UV_VER; Claude Code: $CLAUDE_VER"

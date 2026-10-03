@@ -1,4 +1,4 @@
-﻿便携 AI 工具箱 v0.1.0（Windows x64，MVP 预发布）
+便携 AI 工具箱 v0.1.0（Windows x64，MVP 预发布）
 
 这是不含个人配置的完整便携包。解压整个目录到 U 盘后再运行，不要在 ZIP 里双击。
 
@@ -23,9 +23,12 @@ Windows 与 Linux 分开使用程序包，共用盘内加密供应商配置。
 Claude Code 可在 CC Switch 的「设置 → 关于」中升级；国内镜像优先、官方校验。
 其他 harness 的安装/升级尚未逐项验收。CC Switch 自身检查更新与便携包替换是不同步骤。
 
-本包属于 MVP 预发布，当前验证环境为 Windows x64 / Windows PowerShell 5.1。
+本包属于 MVP 预发布，当前实测环境为 Windows x64 / Windows PowerShell 5.1 和 WSL2 内的 Ubuntu 24.04 x86_64。
 目标电脑的权限策略或安全软件可能限制隔离组件；不承诺所有电脑都已验证。
-拒绝访问时请保留错误，不要关闭系统安全功能或用管理员权限绕过隔离。
+拒绝访问时请保留错误，不要关闭系统安全功能或以管理员身份运行 CC Switch / Claude。
+Linux 若提示 AppArmor 阻止隔离启动，可输入 APPARMOR 同意临时授权，并在 sudo 提示中输入管理员密码。
+此授权只允许当前会话的隔离组件使用用户命名空间；不安装服务、不写持久策略文件，退出时撤销。
+拒绝或授权失败会中止启动，不会以不隔离方式运行。详细权限与撤销说明见 docs/Linux便携使用.md。
 
 不要把使用后的整个目录重新上传：config、sessions、logs、cache、workspace 可能含个人数据。
 SHA256SUMS.txt 用于检查下载 ZIP；release-manifest.json 记录初始包内文件指纹。

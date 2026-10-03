@@ -15,6 +15,8 @@ const runtimeApi = require('./linux-runtime.cjs');
 const sandboxApi = require('./linux-sandbox.cjs');
 let nativeProxyApi = null;
 try { nativeProxyApi = require('./linux-native-proxy.cjs'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
+let usernsApi = null;
+try { usernsApi = require('./linux-userns.cjs'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
 
 const sessions = new Map();
 let exitHandlersInstalled = false;
@@ -66,6 +68,15 @@ function writePrivateOwner(record) {
   const meta = { version: 1, id: record.id, kind: record.kind, root: record.root, volume: volumeIdentity(record.identity), owner: { pid: process.pid, bootId: bootId(), start: processStartTime(process.pid) }, children,
     revision: record.opened.revision || null, keyring: record.opened.keyringBytes.toString('base64'), workHash: record.workHash || null };
   atomicWrite(path.join(record.dir, '.portable-session.json'), Buffer.from(JSON.stringify(meta), 'utf8'));
+}
+
+function authorizationProfileLoaded(authorization) {
+  const name = authorization?.profile?.name;
+  if (typeof name !== 'string' || !/^[A-Za-z0-9_-]+$/.test(name)) return null;
+  try {
+    return fs.readFileSync('/sys/kernel/security/apparmor/profiles', 'utf8')
+      .split('\n').some((line) => line.startsWith(`${name} (`));
+  } catch { return null; }
 }
 
 function ask(question) {
@@ -165,6 +176,92 @@ async function createPrivateSession(root, kind = 'claude') {
   const dir = path.join(base, id); await fsp.mkdir(dir, { mode: 0o700 });
   const record = { id, root, dir, identity: usbIdentity(root), children: new Set(), closed: false, opened: null, timer: null, kind, writerLease: null };
   sessions.set(id, record); return record;
+}
+
+async function gateSandboxUserns(record, runtime, hooks = {}) {
+  const api = hooks.usernsApi || usernsApi;
+  if (!api || typeof api.ensureSandboxUserns !== 'function') throw new Error('Linux AppArmor user namespace capability gate is unavailable.');
+  try {
+    const result = await api.ensureSandboxUserns(runtime, { ask: hooks.ask || ask });
+    record.usernsAuthorization = result?.authorization || null;
+    return result;
+  } catch (error) {
+    if (error?.usernsAuthorization) record.usernsAuthorization = error.usernsAuthorization;
+    const marker = path.join(record.dir, '.apparmor-cleanup-unconfirmed');
+    if (error?.usernsUncertain || error?.usernsAuthorization || fs.existsSync(marker)) {
+      record.usernsCleanupUncertain = true;
+      record.authorizationCleanupError = error;
+    }
+    throw error;
+  }
+}
+
+function assertOwnedRegularTree(root, target) {
+  const resolvedRoot = path.resolve(root), resolved = path.resolve(target);
+  if (resolved !== resolvedRoot && !resolved.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error('Snapshot path escaped its private validation directory.');
+  let cur = resolvedRoot;
+  assertNoLinks(cur);
+  for (const part of path.relative(cur, path.dirname(resolved)).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    try {
+      const st = fs.lstatSync(cur);
+      if (!st.isDirectory() || st.isSymbolicLink() || (process.getuid && st.uid !== process.getuid())) throw new Error('Snapshot validation contains an unsafe path.');
+    } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+  assertNoLinks(resolved);
+}
+
+// restoreSnapshot intentionally only accepts an empty destination. Keep that
+// encrypted-store invariant and validate into a throwaway child, then merge a
+// narrow set of already-decrypted configuration files into the staged runtime.
+async function restoreSessionSnapshot(snapshot, record) {
+  const temp = path.join(record.dir, `.snapshot-validate-${crypto.randomBytes(8).toString('hex')}`);
+  await fsp.mkdir(temp, { mode: 0o700 });
+  try {
+    store.restoreSnapshot(snapshot, temp);
+    const prefixes = ['config/cc-switch/home/.cc-switch/', 'harness/cc-switch/'];
+    const copyFile = (source, destination, root) => {
+      assertOwnedRegularTree(temp, source);
+      const st = fs.lstatSync(source);
+      if (!st.isFile() || st.isSymbolicLink() || (process.getuid && st.uid !== process.getuid())) throw new Error('Snapshot contains an unsafe non-regular file.');
+      assertOwnedRegularTree(root, destination);
+      const relative = path.relative(root, destination);
+      let parent = root;
+      for (const component of path.dirname(relative).split(path.sep).filter(Boolean)) {
+        parent = path.join(parent, component);
+        try { fs.mkdirSync(parent, { mode: 0o700 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+        const pst = fs.lstatSync(parent);
+        if (!pst.isDirectory() || pst.isSymbolicLink() || (process.getuid && pst.uid !== process.getuid())) throw new Error('Snapshot destination contains an unsafe directory.');
+      }
+      assertNoLinks(destination);
+      const input = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      let output;
+      try {
+        output = fs.openSync(destination, 'wx', 0o600);
+        const bytes = fs.readFileSync(input);
+        fs.writeFileSync(output, bytes); fs.fsyncSync(output);
+      } finally { fs.closeSync(input); if (output !== undefined) fs.closeSync(output); }
+    };
+    for (const prefix of prefixes) {
+      const sourceBase = path.join(temp, ...prefix.slice(0, -1).split('/'));
+      if (!fs.existsSync(sourceBase)) continue;
+      const todo = [sourceBase];
+      while (todo.length) {
+        const current = todo.pop(); assertNoLinks(current);
+        for (const ent of fs.readdirSync(current, { withFileTypes: true })) {
+          const source = path.join(current, ent.name); assertNoLinks(source);
+          if (ent.isSymbolicLink()) throw new Error('Snapshot contains a symbolic link.');
+          if (ent.isDirectory()) todo.push(source);
+          else if (ent.isFile()) {
+            const rel = path.relative(temp, source);
+            const destination = path.join(record.dir, ...rel.split(path.sep));
+            const destinationRoot = path.join(record.dir, ...prefix.slice(0, -1).split('/'));
+            copyFile(source, destination, destinationRoot);
+          } else throw new Error('Snapshot contains an unsupported filesystem object.');
+        }
+      }
+    }
+  } finally { await fsp.rm(temp, { recursive: true, force: true }); }
 }
 
 function normalizeHistoryPath(p) {
@@ -500,6 +597,25 @@ async function getLiveProvider(root) {
   });
 }
 async function lockActiveManager(root) {
+  const resolvedRoot = path.resolve(root);
+  const pending = [...sessions.values()].filter((record) => {
+    if (record.kind !== 'cc-switch' || path.resolve(record.root) !== resolvedRoot || record.cleaned || record.broker) return false;
+    const marker = path.join(record.dir, '.apparmor-cleanup-unconfirmed');
+    if (!record.authorizationCleanupError && !record.usernsCleanupUncertain && !fs.existsSync(marker)) return false;
+    return stillMounted(root, record.identity);
+  });
+  if (pending.length) {
+    let cleaned = false;
+    for (const record of pending) {
+      await saveAndRemove(record);
+      cleaned ||= !!record.cleaned;
+      if (!record.cleaned) {
+        const detail = record.authorizationCleanupError?.message || 'temporary AppArmor profile removal is not confirmed';
+        throw new Error(`本 U 盘 CC Switch 会话清理仍未完成；私有目录保留在 ${record.dir}。请先解决 AppArmor 临时规则清理，再重试：${detail}`);
+      }
+    }
+    return cleaned;
+  }
   const paths = brokerPaths(root);
   if (!fs.existsSync(paths.locator)) return false;
   assertNoLinks(paths.locator);
@@ -566,9 +682,15 @@ function installExitHandlers() {
 }
 function waitForChild(child) {
   return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) { resolve({ code: child.exitCode, signal: child.signalCode }); return; }
     child.once('error', reject);
     child.once('exit', (code, signal) => resolve({ code, signal }));
   });
+}
+async function awaitSandboxReady(record, child) {
+  if (!child?.sandboxReady || typeof child.sandboxReady.then !== 'function') throw new Error('Linux sandbox did not provide a namespace setup readiness signal.');
+  await child.sandboxReady;
+  record.discard = false;
 }
 async function stopOwnedProcesses(record) {
   const ownedGroups = [];
@@ -622,8 +744,79 @@ async function saveAndRemove(record) {
 }
 
 async function saveAndRemoveInternal(record) {
-  try { await stopOwnedProcesses(record); } catch (e) { record.closed = false; console.error(e.message); return; }
+  let stopError = null;
+  try { await stopOwnedProcesses(record); } catch (e) { stopError = e; console.error(e.message); }
+  // Keep a live manager's broker and the exact policy lease untouched when
+  // process-group shutdown could not be confirmed. The caller may retry.
+  if (stopError) { record.closed = false; return; }
   if (record.broker) { stopProviderBroker(record.broker); record.broker = null; }
+  if (record.usernsAuthorization) {
+    let releaseConfirmed = false;
+    try {
+      if (!usernsApi?.releaseSandboxUserns) throw new Error('user namespace authorization release API is unavailable');
+      await usernsApi.releaseSandboxUserns(record.usernsAuthorization);
+      releaseConfirmed = true;
+    }
+    catch (e) {
+      // The helper can lose its own unload confirmation after the exact
+      // profile has already disappeared (including a user's manual unload).
+      // Continue only when the kernel profile list positively confirms it is
+      // absent; an unreadable list remains an unconfirmed cleanup.
+      if (authorizationProfileLoaded(record.usernsAuthorization) === false) releaseConfirmed = true;
+      else {
+        record.closed = false;
+        record.authorizationCleanupError = e;
+        console.error(`Linux AppArmor 临时授权释放未确认；会话目录保留在 ${record.dir}，尚未归档或删除。可重试关闭；若需手动卸载，请运行错误中的命令，再重试关闭：${e.message}`);
+        return;
+      }
+    }
+    if (releaseConfirmed) {
+      record.usernsReleaseConfirmed = true;
+      record.usernsAuthorization = null;
+      record.authorizationCleanupError = null;
+    }
+  }
+  const uncertainMarker = path.join(record.dir, '.apparmor-cleanup-unconfirmed');
+  if (record.usernsCleanupUncertain && !record.usernsAuthorization && !record.usernsReleaseConfirmed) {
+    record.closed = false;
+    const detail = record.authorizationCleanupError?.message || 'no authorization handle is available to confirm profile removal';
+    console.error(`Linux AppArmor 清理仍未确认；保留私有会话目录 ${record.dir}，不会归档或删除。请检查临时 profile 并按需手动卸载后重试：${detail}`);
+    return;
+  }
+  if (fs.existsSync(uncertainMarker)) {
+    if (!record.usernsReleaseConfirmed) {
+      record.closed = false;
+      const detail = record.authorizationCleanupError?.message || 'the unconfirmed AppArmor marker has no matching authorization handle';
+      console.error(`Linux AppArmor 清理仍未确认；保留私有会话目录 ${record.dir}，不会归档或删除。请检查临时 profile 并按需手动卸载后重试：${detail}`);
+      return;
+    }
+    try {
+      assertNoLinks(uncertainMarker);
+      const markerStat = fs.lstatSync(uncertainMarker);
+      if (!markerStat.isFile() || markerStat.isSymbolicLink() || (process.getuid && markerStat.uid !== process.getuid())) throw new Error('AppArmor cleanup marker is not an owned regular file.');
+      fs.unlinkSync(uncertainMarker);
+      record.usernsCleanupUncertain = false;
+      record.usernsReleaseConfirmed = false;
+    } catch (e) {
+      record.closed = false; record.authorizationCleanupError = e;
+      console.error(`AppArmor profile 已确认卸载，但无法移除私有清理标记；保留会话目录 ${record.dir} 供重试：${e.message}`);
+      return;
+    }
+  } else if (record.usernsReleaseConfirmed) {
+    record.usernsCleanupUncertain = false;
+    record.usernsReleaseConfirmed = false;
+  }
+  if (record.discard) {
+    if (record.nativeProxy && nativeProxyApi?.closeNativeProxy) {
+      try { await nativeProxyApi.closeNativeProxy(record.nativeProxy); } catch (e) { console.error(`Linux proxy reservation cleanup failed: ${e.message}`); }
+      record.nativeProxy = null;
+    }
+    releaseWriterLease(record.writerLease); record.writerLease = null;
+    if (record.opened && typeof record.opened.close === 'function') record.opened.close();
+    await fsp.rm(record.dir, { recursive: true, force: true });
+    record.cleaned = true; sessions.delete(record.id);
+    return;
+  }
   if (record.nativeProxy && nativeProxyApi?.restorePortableProxySettings) {
     try { await nativeProxyApi.restorePortableProxySettings(record.nativeProxy); }
     catch (e) { record.closed = false; console.error(`Linux 临时代理端口恢复失败；保留私有会话 ${record.dir}：${e.message}`); return; }
@@ -720,54 +913,59 @@ function watchForUnplug(record, label) {
 async function startClaude(root, workDir) {
   installExitHandlers();
   workDir = validateWorkDirectory(root, workDir);
-  const opened = await unlock(root, false);
-  const record = await createPrivateSession(root, 'claude'); record.opened = opened;
+  const record = await createPrivateSession(root, 'claude'); record.discard = true;
   try {
+    const runtime = await runtimeApi.stageRuntime(root, record.dir);
+    await gateSandboxUserns(record, runtime);
+    const opened = await unlock(root, false); record.opened = opened;
     const snapshot = await store.readSnapshot(opened);
     const liveProvider = await getLiveProvider(root);
     if (!snapshot.size && !liveProvider) throw new Error('加密存储还没有 CC Switch 快照；请先打开 CC Switch 并选择供应商。');
     const provider = liveProvider || store.providerFromSnapshot(snapshot);
     if (provider.mode === 'proxy-managed') throw new Error('当前供应商使用 PROXY_MANAGED；需要先打开此 U 盘上的 CC Switch 并启动其 Linux 私有代理。');
     if (provider.mode === 'managed-native-proxy' && !liveProvider) throw new Error('拒绝使用快照中旧的本机代理地址；请打开此 U 盘上的 CC Switch 后重试。');
-    if (snapshot.size) await store.restoreSnapshot(snapshot, record.dir);
-    writePrivateOwner(record);
-    const runtime = await runtimeApi.stageRuntime(root, record.dir);
+    if (snapshot.size) await restoreSessionSnapshot(snapshot, record);
     record.originalSnapshot = snapshot; record.claudeConfigDir = runtime.claudeConfig; record.workHash = historyWorkHash(workDir); writePrivateOwner(record);
     record.initialHistory = restoreLatestClaudeHistory(root, record, runtime.claudeConfig);
     scrubClaudeSettings(runtime.claudeConfig);
     const environment = { ANTHROPIC_BASE_URL: provider.baseUrl, [provider.authEnvironmentName]: provider.secret };
     for (const [key, value] of Object.entries(provider.models || {})) environment[key] = String(value);
     const cfg = sandboxApi.buildSandbox({ sessionRoot: record.dir, runtime, mode: 'claude', command: runtime.claude, args: [], workDir, network: true, extraEnv: environment });
-    const child = sandboxApi.launchSandbox(cfg);
+    const child = sandboxApi.launchSandbox(cfg, { trackSetup: true });
     if (!child || typeof child.pid !== 'number') throw new Error('Linux sandbox did not return an owned child process.');
     child.__owned = true; record.children.add(child); writePrivateOwner(record);
+    await awaitSandboxReady(record, child);
     watchForUnplug(record, '此会话');
-    await waitForChild(child);
+    const result = await waitForChild(child);
+    if (result.code !== 0) console.error(`Claude Code 已退出（${result.signal ? `signal ${result.signal}` : `exit ${result.code}`}）；已保存该会话中完成的加密历史。`);
   } finally { await saveAndRemove(record); }
 }
 
 async function runCcSwitch(root, network) {
   installExitHandlers();
-  const opened = await unlock(root, true);
-  const record = await createPrivateSession(root, 'cc-switch'); record.opened = opened;
+  const record = await createPrivateSession(root, 'cc-switch'); record.discard = true;
   try {
+    const runtime = await runtimeApi.stageRuntime(root, record.dir);
+    await gateSandboxUserns(record, runtime);
+    const opened = await unlock(root, true); record.opened = opened;
     record.writerLease = acquireWriterLease(root);
     record.originalSnapshot = await store.readSnapshot(opened);
-    if (record.originalSnapshot.size) await store.restoreSnapshot(record.originalSnapshot, record.dir);
+    if (record.originalSnapshot.size) await restoreSessionSnapshot(record.originalSnapshot, record);
     writePrivateOwner(record);
     localizeCcSwitchSettings(record.dir);
-    const runtime = await runtimeApi.stageRuntime(root, record.dir);
     record.runtime = runtime;
     for (const name of ['codex', 'gemini', 'grok', 'opencode', 'openclaw', 'hermes', 'pi']) { const dir = path.join(runtime.ccConfig, name); fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); assertNoLinks(dir); }
     record.broker = await startProviderBroker(root, record);
     if (nativeProxyApi?.prepareNativeProxy) record.nativeProxy = await nativeProxyApi.prepareNativeProxy({ sessionRoot: record.dir, network });
     const cfg = sandboxApi.buildSandbox({ sessionRoot: record.dir, runtime, mode: 'cc-switch', command: runtime.ccSwitch, args: [], workDir: runtime.workDir, network });
     if (record.nativeProxy && nativeProxyApi?.releaseReservation) await nativeProxyApi.releaseReservation(record.nativeProxy);
-    const child = sandboxApi.launchSandbox(cfg); if (!child || typeof child.pid !== 'number') throw new Error('Sandbox did not return an owned process.');
+    const child = sandboxApi.launchSandbox(cfg, { trackSetup: true }); if (!child || typeof child.pid !== 'number') throw new Error('Sandbox did not return an owned process.');
     record.managerChild = child; record.children.add(child); writePrivateOwner(record);
+    await awaitSandboxReady(record, child);
     if (record.nativeProxy && nativeProxyApi?.attachManager) nativeProxyApi.attachManager(record.nativeProxy, child.pid);
     watchForUnplug(record, 'CC Switch');
-    await waitForChild(child);
+    const result = await waitForChild(child);
+    if (result.code !== 0) console.error(`CC Switch 已退出（${result.signal ? `signal ${result.signal}` : `exit ${result.code}`}）；已保存会话中的加密配置。`);
   } finally { await saveAndRemove(record); }
 }
 
@@ -840,6 +1038,11 @@ async function showStatus(root) {
   const pending = fs.existsSync(recoveryDir) ? fs.readdirSync(recoveryDir).filter((n) => n.endsWith('.recovery.json')).length : 0;
   console.log(`本机待恢复的加密会话：${pending}`);
   console.log(`Linux 会话数：${sessions.size}`);
+  const readSysctl = (file, boolean = false) => {
+    try { const value = fs.readFileSync(file, 'utf8').trim(); return (boolean ? /^(0|1)$/.test(value) : /^\d+$/.test(value)) ? value : null; }
+    catch { return null; }
+  };
+  console.log(`内核命名空间限制值（事实读取）：unprivileged_userns_clone=${readSysctl('/proc/sys/kernel/unprivileged_userns_clone', true)} apparmor_restrict_unprivileged_userns=${readSysctl('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', true)} max_user_namespaces=${readSysctl('/proc/sys/user/max_user_namespaces')}`);
 }
 
 async function menu(root, mode = 'main') {
@@ -974,4 +1177,4 @@ async function runCli({ root, mode = 'main' }) {
   return menu(root, mode);
 }
 
-module.exports = { askSecret, usbIdentity, stillMounted, createPrivateSession, acquireWriterLease, releaseWriterLease, saveAndRemove, startClaude, showStatus, runCli, installExitHandlers, sessionCount: () => sessions.size, captureClaudeHistory, latestClaudeHistory, restoreLatestClaudeHistory, validateHistoryPayload, localizeCcSwitchSettings, restorePortablePathSettings, validateWorkDirectory, startProviderBroker, stopProviderBroker, getLiveProvider, lockActiveManager, recoverPrivateBundles, restorePrivateBundle, writePrivateOwner, recoverOrphanSession, recoverOrphanSessions, testProvider, scrubClaudeSettings, mountedNoExec, mountedNeedsPrivatePython, pythonEnvironmentLayout, watchForUnplug };
+module.exports = { askSecret, usbIdentity, stillMounted, createPrivateSession, acquireWriterLease, releaseWriterLease, saveAndRemove, startClaude, runCcSwitch, gateSandboxUserns, restoreSessionSnapshot, awaitSandboxReady, waitForChild, showStatus, runCli, installExitHandlers, sessionCount: () => sessions.size, captureClaudeHistory, latestClaudeHistory, restoreLatestClaudeHistory, validateHistoryPayload, localizeCcSwitchSettings, restorePortablePathSettings, validateWorkDirectory, startProviderBroker, stopProviderBroker, getLiveProvider, lockActiveManager, recoverPrivateBundles, restorePrivateBundle, writePrivateOwner, recoverOrphanSession, recoverOrphanSessions, testProvider, scrubClaudeSettings, mountedNoExec, mountedNeedsPrivatePython, pythonEnvironmentLayout, watchForUnplug };
