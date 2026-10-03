@@ -6,9 +6,9 @@ const path = require('node:path');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
 const { PassThrough, Writable } = require('node:stream');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const {
-  CONSENT_TOKEN, CLEANUP_UNCONFIRMED_MARKER, LOADED, STATIC_HELPER, parserPath, usernsRestriction, usernsGlobalBlock, sandboxProfileText,
+  CONSENT_TOKEN, CLEANUP_UNCONFIRMED_MARKER, LOADED, UNLOADED, STATIC_HELPER, parserPath, usernsRestriction, usernsGlobalBlock, sandboxProfileText,
   probeUserns, ensureSandboxUserns, releaseSandboxUserns,
 } = require('./linux-userns.cjs');
 const { sandboxExecEnv } = require('./linux-sandbox.cjs');
@@ -51,6 +51,49 @@ function fakeHooks({ ready = true, closeCode = 0, holdOpen = false } = {}) {
     },
   };
   return { hooks, state };
+}
+
+async function testHelperSignalCleanup(root, profile) {
+  const helperRoot = path.join(root.sessionRoot, 'helper-signal');
+  fs.mkdirSync(helperRoot, { mode: 0o700 });
+  const fakeBin = path.join(helperRoot, 'bin'); fs.mkdirSync(fakeBin, { mode: 0o700 });
+  const parser = path.join(helperRoot, 'parser');
+  const log = path.join(helperRoot, 'parser.log');
+  const executable = (file, contents) => { fs.writeFileSync(file, contents, { mode: 0o755 }); };
+  executable(parser, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$APPARMOR_FAKE_PARSER_LOG"\ncat >/dev/null\nexit 0\n');
+  executable(path.join(fakeBin, 'id'), '#!/bin/sh\n[ "$1" = -u ] && printf 0\n');
+  executable(path.join(fakeBin, 'readlink'), '#!/bin/sh\n[ "$1" = -f ] && [ "$2" = -- ] && { printf "%s\\n" "$3"; exit 0; }\nexit 1\n');
+  executable(path.join(fakeBin, 'stat'), `#!/bin/sh\nfmt=$2; item=$4\ncase "$item" in\n  ${parser}) owner=0; type='regular file'; mode=755 ;;\n  ${root.bwrap}) owner=$SUDO_UID; type='regular file'; mode=700 ;;\n  *) owner=$SUDO_UID; type=directory; mode=700 ;;\nesac\ncase "$fmt" in\n  %u) printf '%s\\n' "$owner" ;;\n  %F) printf '%s\\n' "$type" ;;\n  %a) printf '%s\\n' "$mode" ;;\n  %u:%a:%F) printf '%s:%s:%s\\n' "$owner" "$mode" "$type" ;;\n  *) exit 1 ;;\nesac\n`);
+
+  const helper = STATIC_HELPER.replace('/usr/sbin/apparmor_parser|/sbin/apparmor_parser', parser);
+  const env = { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin`, SUDO_UID: String(process.getuid()),
+    APPARMOR_FAKE_PARSER_LOG: log, LC_ALL: 'C' };
+  const child = spawn('/bin/sh', ['-c', helper, 'portable-ai-apparmor', parser, profile.name, root.bwrap, root.sessionRoot], {
+    cwd: root.sessionRoot, env, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stdout = ''; let stderr = '';
+  child.stdout.setEncoding('utf8'); child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.setEncoding('utf8'); child.stderr.on('data', chunk => { stderr += chunk; });
+  const waitForReady = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`fake AppArmor helper did not reach READY: ${stderr}`)), 3000);
+    const check = () => {
+      if (stdout.includes('PORTABLE_APPARMOR_READY\n')) { clearTimeout(timeout); resolve(); }
+    };
+    child.stdout.on('data', check);
+    child.once('close', (code, signal) => {
+      clearTimeout(timeout);
+      if (!stdout.includes('PORTABLE_APPARMOR_READY\n')) reject(new Error(`fake helper exited before READY (${code ?? signal}): ${stderr}`));
+    });
+  });
+  await waitForReady;
+  child.kill('SIGTERM');
+  child.stdin.end();
+  const closed = await new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal })));
+  assert.deepEqual(closed, { code: 0, signal: null }, 'handled SIGTERM reports policy cleanup success after unloading');
+  assert.match(stdout, /PORTABLE_APPARMOR_UNLOADED\n/, 'the helper confirms unload to its parent before exiting');
+  const parserCalls = fs.readFileSync(log, 'utf8').trim().split('\n');
+  assert.equal(parserCalls.filter(line => line === '-K -a').length, 1, 'signal test loads exactly one profile');
+  assert.equal(parserCalls.filter(line => line === '-K -R').length, 1, 'signal test removes the loaded profile');
 }
 
 async function main() {
@@ -158,6 +201,16 @@ async function main() {
     await releaseSandboxUserns(ensured.authorization);
     assert.equal(fake.state.calls.filter(call => call.file === '/usr/bin/sudo').length, 1);
 
+    const signalClose = fakeHooks({ holdOpen: true }); let signalProbe = true;
+    const signalAuth = await ensureSandboxUserns(root, { probe: () => { if (signalProbe) { signalProbe = false; return deniedProbe(); } return { ok: true }; },
+      restriction: () => 1, parser: '/usr/sbin/apparmor_parser', isTTY: true, hooks: signalClose.hooks,
+      globalBlock: () => null, ask: async () => CONSENT_TOKEN });
+    signalClose.state.child.stdout.write(UNLOADED);
+    signalClose.state.child.exitCode = 143;
+    signalClose.state.child.emit('close', 143, null);
+    assert.equal(await releaseSandboxUserns(signalAuth.authorization), undefined, 'the explicit unload marker confirms cleanup even if sudo returns a signal status');
+    assert.equal(fs.existsSync(path.join(root.sessionRoot, CLEANUP_UNCONFIRMED_MARKER)), false);
+
     const unloadFail = fakeHooks({ closeCode: 89 }); let unloadProbe = true;
     const unloadAuth = await ensureSandboxUserns(root, { probe: () => { if (unloadProbe) { unloadProbe = false; return deniedProbe(); } return { ok: true }; },
       restriction: () => 1, parser: '/usr/sbin/apparmor_parser', isTTY: true, hooks: unloadFail.hooks,
@@ -194,6 +247,7 @@ async function main() {
     assert.doesNotMatch(STATIC_HELPER, /eval|source /);
     const shellSyntax = spawnSync('/bin/sh', ['-n'], { input: STATIC_HELPER, encoding: 'utf8' });
     assert.equal(shellSyntax.status, 0, `static privileged helper has invalid shell syntax: ${shellSyntax.stderr}`);
+    await testHelperSignalCleanup(root, profile);
 
     const actualParser = parserPath();
     if (actualParser) {

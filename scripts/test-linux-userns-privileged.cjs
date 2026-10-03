@@ -62,6 +62,7 @@ async function main() {
     assert.equal(archives.length, 1, 'exactly one official amd64 bubblewrap package');
     const sandboxRoot = path.join(sessionRoot, 'bwrap');
     const extracted = path.join(sandboxRoot, 'root');
+    fs.mkdirSync(extracted, { recursive: true, mode: 0o700 });
     run('/usr/bin/dpkg-deb', ['-x', path.join(sessionRoot, archives[0]), extracted]);
     const runtime = { sessionRoot, runtimeRoot: sessionRoot, sandboxRoot, bwrap: path.join(extracted, 'usr/bin/bwrap') };
     profile = userns.sandboxProfileText(runtime);
@@ -107,7 +108,15 @@ async function main() {
     assert.equal(await closed, 0, 'controller pipe EOF must finish privileged cleanup');
     authorization = null;
     assert.equal(hasProfile(kernelProfiles(), profile.name), false, 'EOF must remove the real kernel profile');
-    console.log('Real AppArmor policy load, bwrap execution, normal unload, and controller EOF unload passed.');
+
+    authorization = (await userns.ensureSandboxUserns(runtime, options())).authorization;
+    const stopped = waitForClose(authorization.child);
+    authorization.child.kill('SIGTERM');
+    await stopped;
+    await userns.releaseSandboxUserns(authorization);
+    authorization = null;
+    assert.equal(hasProfile(kernelProfiles(), profile.name), false, 'terminal/helper signals must remove the profile without a false cleanup failure');
+    console.log('Real AppArmor policy load, duplicate rejection, bwrap execution, normal unload, controller EOF, and signal cleanup passed.');
   } finally {
     if (authorization) {
       try { await userns.releaseSandboxUserns(authorization); }

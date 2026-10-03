@@ -11,6 +11,7 @@ const CONSENT_TOKEN = 'APPARMOR';
 const AUTHENTICATED = 'PORTABLE_APPARMOR_AUTHENTICATED\n';
 const LOADED = 'PORTABLE_APPARMOR_LOADED\n';
 const READY = 'PORTABLE_APPARMOR_READY\n';
+const UNLOADED = 'PORTABLE_APPARMOR_UNLOADED\n';
 const CLEANUP_UNCONFIRMED_MARKER = '.apparmor-cleanup-unconfirmed';
 const CLEANUP_UNCONFIRMED_TEXT = 'AppArmor profile cleanup could not be confirmed.\n';
 const STATIC_HELPER = String.raw`set -eu
@@ -60,7 +61,13 @@ profile_text() {
   printf 'abi <abi/4.0>,\nprofile %s "%s" flags=(unconfined) {\n  userns,\n}\n' "$name" "$attachment"
 }
 if ! profile_text | "$parser" -K -a; then exit 88; fi
-cleanup() { trap - EXIT; profile_text | "$parser" -K -R >/dev/null 2>&1 || exit 89; }
+cleanup() {
+  trap - EXIT
+  if ! profile_text | "$parser" -K -R >/dev/null 2>&1; then exit 89; fi
+  printf '%s' 'PORTABLE_APPARMOR_UNLOADED
+'
+  exit 0
+}
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
@@ -275,7 +282,7 @@ async function ensureSandboxUserns(runtime, options = {}) {
   let stdout = ''; let stderr = '';
   child.stdout?.on('data', chunk => { stdout = (stdout + chunk.toString()).slice(-256); });
   child.stderr?.on('data', chunk => { const value = chunk.toString(); stderr = (stderr + value).slice(-1024); process.stderr.write(value); });
-  const authorization = { child, profile, parser, sessionRoot: rt.sessionRoot, released: false, releasePromise: null, stderr: () => stderr, closed: false, authenticated: false, loaded: false, inputClosed: false };
+  const authorization = { child, profile, parser, sessionRoot: rt.sessionRoot, released: false, releasePromise: null, stderr: () => stderr, closed: false, authenticated: false, loaded: false, unloaded: false, inputClosed: false };
   let ready;
   try { ready = await new Promise((resolve, reject) => {
     let done = false; let timer;
@@ -284,6 +291,7 @@ async function ensureSandboxUserns(runtime, options = {}) {
       if (stdout.includes(AUTHENTICATED) && !timer) timer = setTimeout(() => finish(new Error('temporary AppArmor profile helper timed out after authorization')), options.helperTimeout || 15000);
       if (stdout.includes(AUTHENTICATED)) authorization.authenticated = true;
       if (stdout.includes(LOADED)) authorization.loaded = true;
+      if (stdout.includes(UNLOADED)) authorization.unloaded = true;
       if (stdout.includes(READY)) finish(null, true);
       else if (stdout.length > 128) finish(new Error('AppArmor helper returned unexpected output'));
     };
@@ -319,7 +327,7 @@ function releaseSandboxUserns(authorization, options = {}) {
     const child = authorization.child;
     if (!child) return resolve();
     if (authorization.closed || child.exitCode !== null || child.signalCode !== null) {
-      if (child.exitCode === 0) return resolve();
+      if (child.exitCode === 0 || (authorization.unloaded && child.exitCode !== 89)) return resolve();
       if (child.exitCode === 89) return reject(new Error(`temporary AppArmor profile unload could not be confirmed; run:\n${manualUnload(authorization.profile, authorization.parser)}`));
       if (!authorization.loaded && !authorization.authenticated && !child.signalCode) return resolve();
       if (!authorization.loaded && !child.signalCode && child.exitCode >= 81 && child.exitCode <= 88) return resolve();
@@ -334,7 +342,7 @@ function releaseSandboxUserns(authorization, options = {}) {
     const finish = (error) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(); };
     child.once('close', code => {
       authorization.closed = true;
-      if (code === 0 || (code !== 89 && !authorization.loaded && !authorization.authenticated && code !== null)) finish();
+      if (code === 0 || (code !== 89 && authorization.unloaded) || (code !== 89 && !authorization.loaded && !authorization.authenticated && code !== null)) finish();
       else if (code === 89) finish(new Error(`temporary AppArmor profile helper failed during unload; run:\n${manualUnload(authorization.profile, authorization.parser)}`));
       else if (!authorization.loaded && !child.signalCode && code >= 81 && code <= 88) finish();
       else finish(new Error(`temporary AppArmor profile helper failed during unload; run:\n${manualUnload(authorization.profile, authorization.parser)}`));
@@ -389,7 +397,7 @@ async function guardCommand(runtime, command, args) {
   process.exitCode = code;
 }
 
-module.exports = { CONSENT_TOKEN, AUTHENTICATED, LOADED, READY, CLEANUP_UNCONFIRMED_MARKER, STATIC_HELPER, parserPath, usernsRestriction, usernsGlobalBlock, sandboxProfileText, manualLoad, manualUnload, writeCleanupUnconfirmedMarker, clearCleanupUnconfirmedMarker, probeUserns, ensureSandboxUserns, releaseSandboxUserns };
+module.exports = { CONSENT_TOKEN, AUTHENTICATED, LOADED, READY, UNLOADED, CLEANUP_UNCONFIRMED_MARKER, STATIC_HELPER, parserPath, usernsRestriction, usernsGlobalBlock, sandboxProfileText, manualLoad, manualUnload, writeCleanupUnconfirmedMarker, clearCleanupUnconfirmedMarker, probeUserns, ensureSandboxUserns, releaseSandboxUserns };
 
 if (require.main === module && process.argv[2] === '--guard-command') {
   let i = 3;
