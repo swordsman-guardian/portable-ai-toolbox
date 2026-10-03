@@ -93,12 +93,20 @@ async function main() {
     assert.ok(authorization, 'helper should hold the temporary policy authorization');
     assert.equal(hasProfile(kernelProfiles(), profile.name), true, 'exact-path profile must be present in the real kernel');
     assert.equal(userns.probeUserns(runtime).ok, true, 'real bubblewrap must execute after the profile grant');
+    if (naturalRestriction) {
+      const other = path.join(extracted, 'usr/bin/bwrap-unapproved');
+      fs.copyFileSync(runtime.bwrap, other, fs.constants.COPYFILE_EXCL);
+      const denied = userns.probeUserns({ ...runtime, bwrap: other });
+      assert.equal(denied.ok, false, 'the temporary rule must not authorize another executable path');
+      assert.equal(denied.kind, 'namespace-permission');
+    }
     await assert.rejects(userns.ensureSandboxUserns(runtime, options()), /before readiness|profile/i,
       'a second helper must not replace or take ownership of an existing profile');
     assert.equal(hasProfile(kernelProfiles(), profile.name), true, 'rejected duplicate authorization must leave the original profile loaded');
     await userns.releaseSandboxUserns(authorization);
     authorization = null;
     assert.equal(hasProfile(kernelProfiles(), profile.name), false, 'normal release must unload the real profile');
+    console.log('Real exact-path grant, duplicate rejection, and normal release passed.');
 
     authorization = (await userns.ensureSandboxUserns(runtime, options())).authorization;
     assert.equal(hasProfile(kernelProfiles(), profile.name), true);
@@ -108,12 +116,15 @@ async function main() {
     assert.equal(await closed, 0, 'controller pipe EOF must finish privileged cleanup');
     authorization = null;
     assert.equal(hasProfile(kernelProfiles(), profile.name), false, 'EOF must remove the real kernel profile');
+    console.log('Real controller pipe EOF cleanup passed.');
 
     authorization = (await userns.ensureSandboxUserns(runtime, options())).authorization;
     const stopped = waitForClose(authorization.child);
     authorization.child.kill('SIGTERM');
-    await stopped;
+    // The manager closes its controller pipe during signal shutdown. A POSIX
+    // shell may defer its TERM trap until the foreground cat receives EOF.
     await userns.releaseSandboxUserns(authorization);
+    await stopped;
     authorization = null;
     assert.equal(hasProfile(kernelProfiles(), profile.name), false, 'terminal/helper signals must remove the profile without a false cleanup failure');
     console.log('Real AppArmor policy load, duplicate rejection, bwrap execution, normal unload, controller EOF, and signal cleanup passed.');
