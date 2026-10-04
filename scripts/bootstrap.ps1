@@ -2,14 +2,16 @@
 #  bootstrap.ps1 —— 一次性初始化：把便携运行时下载到 U 盘
 #  用法：powershell -ExecutionPolicy Bypass -File bootstrap.ps1
 #  可选：-SkipPython  跳过 Python 预装
-#  说明：只在本机跑一次。跑完之后插到任何机器都不再需要下载。
+#  说明：只在准备源码的电脑上运行；其他电脑是否还需下载，取决于源码目录中已有的运行时。
 # ============================================================
 
 [CmdletBinding()]
 param(
     [switch]$SkipPython,
     [switch]$Force,             # 已存在的运行时也重新下载
-    [switch]$UseSystemProxy     # 强制走系统代理（公司内网等场景）。默认绕过
+    [switch]$UseSystemProxy,    # 强制走系统代理（公司内网等场景）。默认绕过
+    [switch]$OfficialOnly,      # 不使用旧公共代理或仅凭体积接受文件；所有来源必须匹配源码 SHA pin
+    [switch]$AllowVerifiedMirrors # 官方源先试；仅限时失败后才用固定版本 USTC 路径，并始终校验同一 SHA pin
 )
 
 Set-StrictMode -Version Latest
@@ -36,8 +38,23 @@ function Invoke-Download {
     param(
         [Parameter(Mandatory)][string]$Url,
         [Parameter(Mandatory)][string]$OutFile,
-        [long]$ExpectedSize = 0
+        [long]$ExpectedSize = 0,
+        [int]$TimeoutSeconds = 240
     )
+    if ($OfficialOnly) {
+        $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+        if (-not [IO.File]::Exists($curl)) { throw '严格官方准备需要 Windows 自带的 curl.exe，以可靠处理官方 HTTPS 下载。' }
+        $parent = Split-Path -Parent $OutFile
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        & $curl '--fail' '--location' '--proto' '=https' '--proto-redir' '=https' '--noproxy' '*' '--connect-timeout' '30' '--max-time' ([string]$TimeoutSeconds) '--silent' '--show-error' '--output' $OutFile '--url' $Url
+        if ($LASTEXITCODE -ne 0) {
+            if (Test-Path -LiteralPath $OutFile) { Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue }
+            throw "官方 HTTPS 下载失败（curl $LASTEXITCODE）：$Url"
+        }
+        $curlBytes = (Get-Item -LiteralPath $OutFile).Length
+        if ($ExpectedSize -gt 0 -and $curlBytes -ne $ExpectedSize) { throw "官方文件长度不符：期望 $ExpectedSize，实际 $curlBytes" }
+        return $curlBytes
+    }
     $req = [Net.HttpWebRequest]::Create($Url)
     $req.UserAgent = 'aistick/0.1'
     $req.Timeout = 30000
@@ -88,14 +105,16 @@ function Invoke-DownloadWithFallback {
     param(
         [Parameter(Mandatory)][string[]]$Urls,
         [Parameter(Mandatory)][string]$OutFile,
-        [long]$ExpectedSize = 0
+        [long]$ExpectedSize = 0,
+        [int]$TimeoutSeconds = 240
     )
     $errs = @()
-    foreach ($u in $Urls) {
+    $downloadUrls = if ($OfficialOnly -and -not $AllowVerifiedMirrors) { @($Urls | Select-Object -First 1) } else { $Urls }
+    foreach ($u in $downloadUrls) {
         try {
             $short = if ($u.Length -gt 78) { $u.Substring(0, 75) + '...' } else { $u }
             Write-Log "来源: $short"
-            $size = Invoke-Download -Url $u -OutFile $OutFile -ExpectedSize $ExpectedSize
+            $size = Invoke-Download -Url $u -OutFile $OutFile -ExpectedSize $ExpectedSize -TimeoutSeconds $TimeoutSeconds
             Write-Log ("下载完成 {0:N1} MB" -f ($size / 1MB)) 'OK'
             return $u
         } catch {
@@ -105,6 +124,21 @@ function Invoke-DownloadWithFallback {
         }
     }
     throw "所有来源都失败:`n  " + ($errs -join "`n  ")
+}
+
+function Get-OfficialGithubAssetSha256 {
+    param([Parameter(Mandatory)][string]$Repository,[Parameter(Mandatory)][string]$Tag,[Parameter(Mandatory)][string]$AssetName)
+    $tmp = Join-Path $StickRoot 'cache\dl'
+    if (-not (Test-Path -LiteralPath $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
+    $apiUrl = 'https://api.github.com/repos/{0}/releases/tags/{1}' -f $Repository,[Uri]::EscapeDataString($Tag)
+    $jsonPath = Join-Path $tmp ('github-release-' + ($Repository.Replace('/','-')) + '-' + $Tag + '.json')
+    Invoke-Download -Url $apiUrl -OutFile $jsonPath | Out-Null
+    $release = [IO.File]::ReadAllText($jsonPath,[Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop
+    $assets = @($release.assets | Where-Object { [string]$_.name -ceq $AssetName })
+    if ($assets.Count -ne 1 -or [string]$assets[0].digest -notmatch '^sha256:([0-9a-fA-F]{64})$') {
+        throw "GitHub 官方 release metadata 没有为 $AssetName 提供唯一 SHA-256 digest。"
+    }
+    return $Matches[1].ToUpperInvariant()
 }
 
 function Test-Sha256 {
@@ -164,28 +198,35 @@ if ($NodeOk -and -not $Force) {
     $tmp = Join-Path $StickRoot 'cache\dl'
     if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
 
-    # 先取官方校验文件（官方源实测可用且快）
-    $sumsUrl = "https://nodejs.org/dist/$NodeVer/SHASUMS256.txt"
-    $sumsTxt = Join-Path $tmp 'SHASUMS256.txt'
-    Invoke-DownloadWithFallback -Urls @(
-        $sumsUrl,
-        "https://registry.npmmirror.com/-/binary/node/$NodeVer/SHASUMS256.txt"
-    ) -OutFile $sumsTxt | Out-Null
-
     $wantHash = $null
-    foreach ($line in [IO.File]::ReadAllLines($sumsTxt)) {
-        if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?' + [regex]::Escape($NodeZip) + '\s*$') {
-            $wantHash = $Matches[1]; break
+    if ($OfficialOnly -and $NodeVer -eq 'v24.21.0' -and $NodeZip -eq 'node-v24.21.0-win-x64.zip') {
+        # 固定值来自 nodejs.org 官方 SHASUMS256.txt；严格准备不会从下载镜像同时取得校验值。
+        $wantHash = '158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541'
+    } else {
+        # 兼容旧的基础准备路径：从官方校验文件获取哈希。
+        $sumsUrl = "https://nodejs.org/dist/$NodeVer/SHASUMS256.txt"
+        $sumsTxt = Join-Path $tmp 'SHASUMS256.txt'
+        Invoke-DownloadWithFallback -Urls @(
+            $sumsUrl,
+            "https://registry.npmmirror.com/-/binary/node/$NodeVer/SHASUMS256.txt"
+        ) -OutFile $sumsTxt | Out-Null
+        foreach ($line in [IO.File]::ReadAllLines($sumsTxt)) {
+            if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?' + [regex]::Escape($NodeZip) + '\s*$') {
+                $wantHash = $Matches[1]; break
+            }
         }
     }
-    if (-not $wantHash) { throw "在 SHASUMS256.txt 里找不到 $NodeZip 的校验值" }
+    if (-not $wantHash) { throw "无法取得 $NodeZip 的受信任固定校验值" }
     Write-Log "期望 sha256: $($wantHash.Substring(0,16))..."
 
     $zipPath = Join-Path $tmp $NodeZip
-    Invoke-DownloadWithFallback -Urls @(
-        "https://nodejs.org/dist/$NodeVer/$NodeZip",
-        "https://registry.npmmirror.com/-/binary/node/$NodeVer/$NodeZip"
-    ) -OutFile $zipPath | Out-Null
+    if ($OfficialOnly -and (Test-Path -LiteralPath $zipPath) -and (Test-Sha256 -Path $zipPath -Expected $wantHash)) {
+        Write-Log '复用已通过官方 SHA-256 校验的 Node 缓存' 'OK'
+    } else {
+    $nodeUrls = @("https://nodejs.org/dist/$NodeVer/$NodeZip")
+    if ($AllowVerifiedMirrors) { $nodeUrls += "https://registry.npmmirror.com/-/binary/node/$NodeVer/$NodeZip" }
+    Invoke-DownloadWithFallback -Urls $nodeUrls -OutFile $zipPath | Out-Null
+    }
 
     if (Test-Sha256 -Path $zipPath -Expected $wantHash) {
         Write-Log 'sha256 校验通过' 'OK'
@@ -213,6 +254,7 @@ if ($NodeOk -and -not $Force) {
 # 用 0.12.17 而不是最新的 0.12.18：USTC 镜像上 0.12.17 已归档且有 .sha256，
 # 能做强校验；公共代理上有 .18 但吞吐不可靠。
 $UvVer   = '0.12.17'
+$UvSha256 = 'A252121D5B59398FCB137C6EA448176459A44010F33F67E0072305A637119CA7'
 $UvName  = 'uv-x86_64-pc-windows-msvc.zip'
 $UvSize  = 17906210        # 该版本的真实体积（已实测）
 $UvDir   = Join-Path $StickRoot 'runtime\uv'
@@ -227,23 +269,32 @@ if ((Test-Path $UvExe) -and -not $Force) {
     $tmp = Join-Path $StickRoot 'cache\dl'
     if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
     $ghUrl = "https://github.com/astral-sh/uv/releases/download/$UvVer/$UvName"
+    # Astral 自己的官方下载域名，官方安装文档也使用该路径；仍以固定 SHA 校验内容。
+    $officialUvUrl = "https://releases.astral.sh/github/uv/releases/download/$UvVer/$UvName"
     $zipPath = Join-Path $tmp $UvName
-    $mirrors = Get-GithubUrls $ghUrl
+    $mirrors = if ($OfficialOnly) {
+        if ($AllowVerifiedMirrors) { @($officialUvUrl,$ghUrl,"https://gh-proxy.com/$ghUrl") } else { @($officialUvUrl) }
+    } else { Get-GithubUrls $ghUrl }
 
-    # USTC 提供 .sha256，能做强校验；拿不到就退回体积校验
+    # 严格准备只接受 GitHub 官方 release API 给出的该资产 SHA-256。
     $wantHash = $null
-    foreach ($u in $mirrors[0..([Math]::Min(1, $mirrors.Count - 1))]) {
+    $checksumUrls = if ($OfficialOnly) { @() } else { @($mirrors[0..([Math]::Min(1, $mirrors.Count - 1))] | ForEach-Object { $_ + '.sha256' }) }
+    if ($OfficialOnly) { $wantHash = $UvSha256 }
+    foreach ($u in $checksumUrls) {
         try {
             $tmpSum = Join-Path $tmp 'uv.sha256'
-            Invoke-Download -Url "$u.sha256" -OutFile $tmpSum | Out-Null
+            Invoke-Download -Url $u -OutFile $tmpSum | Out-Null
             $txt = [IO.File]::ReadAllText($tmpSum)
             if ($txt -match '([0-9a-fA-F]{64})') { $wantHash = $Matches[1]; break }
         } catch { continue }
     }
-    if ($wantHash) { Write-Log "期望 sha256: $($wantHash.Substring(0,16))...（来自 USTC）" }
+    if ($wantHash) { Write-Log "期望 sha256: $($wantHash.Substring(0,16))...（官方固定校验值）" }
+    elseif ($OfficialOnly) { throw 'uv 官方 release 没有提供可用的 SHA-256；严格准备已停止。' }
     else { Write-Log '拿不到 sha256，改用体积校验' 'WARN' }
 
-    Invoke-DownloadWithFallback -Urls $mirrors -OutFile $zipPath -ExpectedSize $UvSize | Out-Null
+    if ($OfficialOnly -and (Test-Path -LiteralPath $zipPath) -and (Get-Item -LiteralPath $zipPath).Length -eq $UvSize -and (Test-Sha256 -Path $zipPath -Expected $wantHash)) {
+        Write-Log '复用已通过官方 SHA-256 校验的 uv 缓存' 'OK'
+    } else { Invoke-DownloadWithFallback -Urls $mirrors -OutFile $zipPath -ExpectedSize $UvSize | Out-Null }
 
     if ($wantHash) {
         if (Test-Sha256 -Path $zipPath -Expected $wantHash) {
@@ -267,8 +318,9 @@ if ((Test-Path $UvExe) -and -not $Force) {
 # ============================================================
 #  3. PortableGit（含 bash.exe —— Claude Code 的 Bash 工具需要）
 # ============================================================
-$GitVer  = 'v2.55.0.windows.5'
-$GitName = 'PortableGit-2.55.0.5-64-bit.7z.exe'
+$GitVer  = 'v2.56.0.windows.1'
+$GitName = 'PortableGit-2.56.0-64-bit.7z.exe'
+$GitSha256 = 'ECEB5E061AA90DF2F69DDD3E90F0030E1B8037A7829934BC40E4BE1CAA1ACCC1'
 $GitDir  = Join-Path $StickRoot 'runtime\git'
 $BashExe = Join-Path $GitDir 'bin\bash.exe'
 
@@ -283,8 +335,15 @@ if ((Test-Path $BashExe) -and -not $Force) {
     $ghUrl = "https://github.com/git-for-windows/git/releases/download/$GitVer/$GitName"
     $sfx   = Join-Path $tmp $GitName
 
-    $expSize = 58960208
-    Invoke-DownloadWithFallback -Urls (Get-GithubUrls $ghUrl) -OutFile $sfx -ExpectedSize $expSize | Out-Null
+    $expSize = 59958024
+    if ($OfficialOnly) {
+        if (-not ((Test-Path -LiteralPath $sfx) -and (Get-Item -LiteralPath $sfx).Length -eq $expSize -and (Test-Sha256 -Path $sfx -Expected $GitSha256))) {
+            $gitUrls = @($ghUrl)
+            if ($AllowVerifiedMirrors) { $gitUrls += "https://mirrors.ustc.edu.cn/github-release/git-for-windows/git/LatestRelease/$GitName" }
+            Invoke-DownloadWithFallback -Urls $gitUrls -OutFile $sfx -ExpectedSize $expSize -TimeoutSeconds 240 | Out-Null
+        } else { Write-Log '复用已通过官方 SHA-256 校验的 PortableGit 缓存' 'OK' }
+        if (-not (Test-Sha256 -Path $sfx -Expected $GitSha256)) { Remove-Item -LiteralPath $sfx -Force; throw 'PortableGit 官方 SHA-256 校验失败。' }
+    } else { Invoke-DownloadWithFallback -Urls (Get-GithubUrls $ghUrl) -OutFile $sfx -ExpectedSize $expSize | Out-Null }
 
     Write-Log '自解压中（FAT32 上硬链接会退化成副本，体积会比官方大，属正常）...'
     Remove-ItemForce -Path $GitDir | Out-Null
@@ -326,6 +385,7 @@ Write-Log '--- [4/4] Python 预装 ---'
 $PyRelVer = '3.12.14'
 $PyTag    = '20260901'
 $PyName   = "cpython-$PyRelVer+$PyTag-x86_64-pc-windows-msvc-install_only.tar.gz"
+$PySha256 = 'E90C1B6419DA3BD812DD73BB3DE40287A21ABF153438147639EC5E20375EA93F'
 $PySize   = 46184075      # 已实测
 $PyDir    = Join-Path $StickRoot 'runtime\python'
 $PyExe    = Join-Path $PyDir 'python.exe'
@@ -341,14 +401,25 @@ if ($SkipPython) {
     # USTC 路径布局与 GitHub 的 releases/download 不同（少了 releases/download 一层），
     # 所以这里手写 URL，不走 Get-GithubUrls
     $pbsBase = 'https://mirrors.ustc.edu.cn/github-release/astral-sh/python-build-standalone'
-    $tarUrls = @(
+    $officialPythonUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/$PyTag/$PyName"
+    $officialAstralPythonUrl = "https://releases.astral.sh/github/python-build-standalone/releases/download/$PyTag/$PyName"
+    $tarUrls = if ($OfficialOnly) {
+        if ($AllowVerifiedMirrors) { @($officialAstralPythonUrl,$officialPythonUrl,"https://gh-proxy.com/$officialPythonUrl") } else { @($officialAstralPythonUrl) }
+    } else { @(
         "$pbsBase/$PyTag/$PyName",
         "$pbsBase/LatestRelease/$PyName",
         "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download/$PyTag/$PyName"
-    )
+    ) }
 
     $tarball = Join-Path $tmp $PyName
+    if ($OfficialOnly) {
+        if (-not ((Test-Path -LiteralPath $tarball) -and (Get-Item -LiteralPath $tarball).Length -eq $PySize -and (Test-Sha256 -Path $tarball -Expected $PySha256))) {
+            Invoke-DownloadWithFallback -Urls $tarUrls -OutFile $tarball -ExpectedSize $PySize -TimeoutSeconds 240 | Out-Null
+        } else { Write-Log '复用已通过官方 SHA-256 校验的 Python 缓存' 'OK' }
+        if (-not (Test-Sha256 -Path $tarball -Expected $PySha256)) { Remove-Item -LiteralPath $tarball -Force; throw 'Python 官方 SHA-256 校验失败。' }
+    } else {
     Invoke-DownloadWithFallback -Urls $tarUrls -OutFile $tarball -ExpectedSize $PySize | Out-Null
+    }
 
     Write-Log '解压 Python（约 3400 个文件，FAT32 上要一两分钟）...'
     $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
@@ -358,9 +429,9 @@ if ($SkipPython) {
 
     # tarball 顶层是 python/ 一层，直接解到 runtime\ 就会得到 runtime\python\
     Remove-ItemForce -Path $PyDir | Out-Null
-    $p = Start-Process -FilePath $tarExe -ArgumentList @('-xzf', $tarball, '-C', (Join-Path $StickRoot 'runtime')) `
-         -Wait -PassThru -NoNewWindow
-    if ($p.ExitCode -ne 0) { throw "tar 解压失败，返回码 $($p.ExitCode)" }
+    & $tarExe '-xzf' $tarball '-C' (Join-Path $StickRoot 'runtime')
+    $tarExitCode = $LASTEXITCODE
+    if ($tarExitCode -ne 0) { throw "tar 解压失败，返回码 $tarExitCode" }
     Remove-Item -LiteralPath $tarball -Force -EA SilentlyContinue
 
     if (-not (Test-Path $PyExe)) { throw "解压后找不到 $PyExe" }
@@ -400,8 +471,9 @@ $total = (Get-ChildItem $StickRoot -Recurse -Force -File -EA SilentlyContinue |
 Write-Host ("U 盘当前占用: {0:N0} MB" -f ($total/1MB))
 Write-Host ''
 Write-Host '下一步：' -ForegroundColor Yellow
-Write-Host '  1) 双击 AI设置.cmd，选「安装 harness」把 Claude Code 装进盘'
-Write-Host '  2) 在 config\keys.env 里填入你的阿里云百炼密钥'
-Write-Host '  3) 双击 AI.cmd 开始使用'
+Write-Host '这里只准备了基础运行时；CC Switch、WebView2、更新适配器和 Claude Code 尚未准备。' -ForegroundColor Yellow
+Write-Host '全新源码目录首次完整准备：双击源码根目录的「准备Windows.cmd」。'
+Write-Host '准备完成后，在 AI设置.cmd 中选「10 CC Switch」，再选「8 联网」创建主密码并配置供应商。'
+Write-Host 'Visual Studio C++ 工具链只需要装在准备这份源码的电脑上；日常使用电脑不需要。'
 Write-Host ''
 Write-Log "日志: $script:LogPath"

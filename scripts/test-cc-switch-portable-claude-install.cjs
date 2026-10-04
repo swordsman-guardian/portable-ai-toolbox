@@ -408,6 +408,65 @@ test('fetches only the exact-version mirror tarball, permits its pinned CDN redi
   assert.match(seen[1], /^cdn\.npmmirror\.com\/packages\//);
 });
 
+test('installs the initial Claude package from official registry metadata into an empty managed prefix', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-initial-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const rel of ['runtime/node', 'runtime/updates', 'cache', 'npm-global']) fs.mkdirSync(path.join(root, rel), { recursive: true });
+  fs.writeFileSync(path.join(root, '.aistick-open-source-preparation.json'), JSON.stringify({ schema: 1, kind: 'aistick-windows-preparation', state: 'running' }));
+  const version = '9.8.7';
+  const parentName = installer.constants.PARENT_NAME;
+  const platformName = installer.constants.PLATFORM_NAME;
+  const parentArchive = tar([
+    { name: 'package/package.json', data: JSON.stringify({ name: parentName, version, optionalDependencies: { [platformName]: version } }) },
+    { name: 'package/bin/claude.js', data: '#!/usr/bin/env node\n' },
+  ]);
+  const platformArchive = tar([
+    { name: 'package/package.json', data: JSON.stringify({ name: platformName, version }) },
+    { name: 'package/claude.exe', data: makePe(version) },
+  ]);
+  const metadata = (name, archive) => ({
+    name, version,
+    dist: {
+      tarball: `https://registry.npmjs.org/${name}/-/${name.split('/').pop()}-${version}.tgz`,
+      integrity: `sha512-${crypto.createHash('sha512').update(archive).digest('base64')}`,
+    },
+  });
+  const parentMeta = metadata(parentName, parentArchive);
+  const platformMeta = metadata(platformName, platformArchive);
+  const requests = [];
+  const transport = mockedGet(({ url, callback }) => {
+    requests.push(url.href);
+    const route = url.pathname;
+    if (route.endsWith('/latest')) return deliverResponse(callback, 200, Buffer.from(JSON.stringify({ ...parentMeta, optionalDependencies: { [platformName]: version } })), { 'content-length': String(Buffer.byteLength(JSON.stringify({ ...parentMeta, optionalDependencies: { [platformName]: version } }))) });
+    if (route.includes(`/${platformName.split('/').pop()}-${version}.tgz`)) return deliverResponse(callback, 200, platformArchive, { 'content-length': String(platformArchive.length) });
+    if (route.includes(`/${parentName.split('/').pop()}-${version}.tgz`)) return deliverResponse(callback, 200, parentArchive, { 'content-length': String(parentArchive.length) });
+    if (route.includes(encodeURIComponent(platformName)) || route.includes(platformName.replace('/', '%2F'))) {
+      const body = Buffer.from(JSON.stringify(platformMeta));
+      return deliverResponse(callback, 200, body, { 'content-length': String(body.length) });
+    }
+    const error = new Error(`unexpected mock route ${route}`); error.code = 'ENOTFOUND'; callback(new MockResponse(404));
+  });
+  const result = await installer.installInitial(root, { transport, wait: async () => {} });
+  assert.deepEqual(result, { version, alreadyInstalled: false });
+  const packageRoot = path.join(root, 'npm-global', 'node_modules', '@anthropic-ai', 'claude-code');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version, version);
+  assert.equal(fs.readFileSync(path.join(root, 'npm-global', 'claude.cmd'), 'utf8'), installer.constants.SHIM);
+  assert.ok(requests.length >= 4);
+  assert.ok(requests.every(request => new URL(request).hostname === installer.constants.REGISTRY), 'initial installation must not contact the mirror');
+  assert.deepEqual(await installer.installInitial(root, { transport, wait: async () => {} }), { version, alreadyInstalled: true });
+});
+
+test('initial Claude install refuses an unowned root or a prefix containing user files', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-initial-refuse-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const rel of ['runtime/node', 'runtime/updates', 'cache', 'npm-global']) fs.mkdirSync(path.join(root, rel), { recursive: true });
+  assert.throws(() => installer.validateInitialRoot(root), e => e.code === 'E_ROOT_MARKER');
+  fs.writeFileSync(path.join(root, '.aistick-open-source-preparation.json'), JSON.stringify({ schema: 1, kind: 'aistick-windows-preparation', state: 'running' }));
+  fs.writeFileSync(path.join(root, 'npm-global', 'keep.txt'), 'user data');
+  assert.throws(() => installer.validateInitialRoot(root), e => e.code === 'E_PREFIX');
+  assert.equal(fs.readFileSync(path.join(root, 'npm-global', 'keep.txt'), 'utf8'), 'user data');
+});
+
 test('falls back to the official exact tarball on mirror transport or SRI failure', async () => {
   const archive = Buffer.from('trusted official archive');
   const wrong = Buffer.from('tampered mirror bytes');

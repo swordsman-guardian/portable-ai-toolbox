@@ -1,78 +1,34 @@
-# 便携 AI 工具箱 / Portable AI Toolbox
+# 便携 AI 工具箱
 
-面向 Windows 和 Linux 的 U 盘便携 AI 编程工具箱 MVP。同一个盘保存两套运行时和一份加密供应商配置，入口按系统选择对应实现。此仓库保存源码、测试和设计说明，不包含个人配置或可直接运行的完整 U 盘镜像。
+便携 AI 编程环境的源码项目，当前版本为 **v0.2.0-alpha.1**。它用 U 盘保存工具箱程序、项目工作区和加密后的 CC Switch 配置；每次使用时，在当前电脑的私有会话目录中运行程序。
 
-## 当前能力
+## 适用范围
 
-- 使用盘内 Node、Git、Python、uv 等运行时，支持独立会话及归档恢复。
-- 通过隔离会话接入官方 CC Switch，统一管理供应商配置，配置使用主密码加密保存。
-- CC Switch 与电脑上既有实例分离；支持联网检测及受管 Claude Code 升级。
-- Windows 下的 Claude Code 已完成真实原生界面升级验收：2.1.281 → 2.1.285。程序包优先从固定国内镜像下载，依据官方元数据校验，失败回退官方源。
-- 其他 harness 的原生安装、升级还需逐项适配和验收。
-- Linux 使用官方 CC Switch AppImage、盘内 Node/Python/uv/Git 和便携隔离组件；运行时在本机私有目录展开，适应 FAT32 和禁止直接执行程序的 U 盘挂载方式。具体要求、启动方式及验证范围见 [Linux 使用说明](docs/Linux便携使用.md)。
+当前目标环境为 Windows 10/11 x64 和 Ubuntu 24.04 x64。Windows 11 Home x64（10.0.26200）与 PowerShell 5.1 的独立空源码目录准备已成功；Windows 10 尚无实体机验证结果。Linux 完整准备脚本、冷准备与图形启动已在 WSL2 Ubuntu 24.04 x64 / WSLg 完成验证，覆盖 Node 22.23.3、uv 0.8.22、CC Switch 3.20.4、Git、bubblewrap、Python 3.12.11 和 Claude Code 2.1.289。Linux 运行包面向 glibc 2.38 及以上；其他发行版、处理器架构、系统策略和安全软件尚未全面验证。WSL 与 GitHub CI 的验证结果不能代替实体机兼容性测试；AppArmor 临时授权路径在 GitHub 托管 runner 上验证过，当前 WSL 环境没有启用 AppArmor。
 
-## 目录
+这不是“任意电脑都能运行”的承诺。项目仍处于 alpha 阶段，使用前请阅读[首次使用说明](docs/首次使用.md)和[当前版本说明](docs/Release-v0.2.0.md)。
 
-- `AI.cmd`：日常启动入口。
-- `AI设置.cmd`：设置入口。
-- `AI诊断.cmd`：CC Switch 无法识别 Claude Code 时的离线诊断入口，不需要解锁配置。
-- `AI.sh`、`AI设置.sh`、`AI诊断.sh`：对应的 Linux 入口。用 `bash AI.sh` 启动，不要求在 U 盘上保存执行权限。
-- `scripts/`：PowerShell、Python、Node 与原生隔离适配源码，以及回归测试。
-- `harness/registry.json`：不含凭据的 harness 适配定义。
-- `docs/`：经过筛选的设计与使用文档；部分文档记录历史阶段，以当前源码为准。
+## 获取与准备
 
-## 从源码准备
+源码包不包含 Node、CC Switch、Claude Code、WebView2 或其他第三方运行程序。Windows 准备机使用 Windows 10/11 x64、Windows PowerShell 5.1，并预先安装 Visual Studio 的“使用 C++ 的桌面开发”工作负载。把源码包中的顶层文件平铺到一个全新的目录后，双击 `准备Windows.cmd`；入口会先检查准备条件，再联网下载和校验依赖。下载优先使用官方来源；若使用镜像，也必须通过官方固定 SHA-256 校验，文件大小不能代替哈希校验。首次准备可能需要较长时间，取决于网络，并需为下载与解压预留数 GB 空间。准备成功后，把准备目录内的全部文件和文件夹复制到 U 盘根目录，确保入口文件与 `scripts/` 位于同一层。每个新源码目录只准备一次；不要在已经含有个人配置或会话的目录中重跑。
 
-开发及主要验证环境为 Windows x64 / Windows PowerShell 5.1。仓库不包含下载好的运行时、CC Switch、WebView2、harness 程序包或编译产物。
+Windows 独立源码 fixture 准备成功，覆盖依赖校验、编译与 Claude CLI 检查；CC Switch 官方 ZIP 使用本轮从官方 Release 获取的缓存并由入口再次按固定 SHA-256 校验。匿名下载通道未完整下载该 ZIP，仅完成 HEAD/分段探测，因此实际下载成功时间仍取决于网络。公开附件固定为 `portable-ai-toolbox-v0.2.0-alpha.1-source.zip`、`release-manifest.json` 和 `SHA256SUMS.txt`，不含完整 U 盘镜像。Linux 的 Ubuntu 24.04 x64 准备命令见[首次使用说明](docs/首次使用.md)。
 
-1. 在目标 U 盘目录克隆仓库，运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bootstrap.ps1` 准备基础运行时。下载需要联网。
-2. CC Switch 包由 `scripts/cc-switch.ps1` 管理固定版本和校验；完整隔离启动还需要对应 WebView2 运行时及原生适配器。
-3. 原生适配器源码位于 `scripts/cc-switch-portable-updater-shim.cpp` 等文件，构建入口为 `scripts/build-cc-switch-portable-updater-shim.ps1`，需要可用的 Visual Studio C++ x64 构建环境，可通过 `-VsDevCmd` 指定工具链。构建依赖用于准备阶段，不要求在每台使用电脑上安装。
-4. 根据相应脚本及 `docs/` 配置便携依赖，在本机窗口创建主密码，通过 CC Switch 配置供应商；真实凭据不写入仓库。当前尚无完整的一键从空仓库装配流程。
+准备完成后，Windows 从盘内 `AI.cmd` 启动；Linux 从终端运行 `bash AI.sh`。Linux 默认使用 U 盘根目录下的 `workspace/`。Windows 首次使用时默认也是该目录；已有记忆的电脑会把上次使用的工作目录作为回车默认值。两边都可以明确选择其他项目目录。CC Switch 应在一个会话终端中保持运行，再从另一个终端启动 Claude；退出并等待保存完成后再拔盘。
 
-## 仓库数据边界
+## 重要边界
 
-`.gitignore` 使用源码白名单；新文件必须明确审查后才纳入。以下数据即使加密，也不上传：
+- 主密码和 API 凭据只在本机工具界面输入，不要发送到聊天或提交到仓库。
+- 初始化不要求发送真实 API 请求。连接测试会真实访问所选供应商并可能产生费用，只有你明确选择后才会执行。
+- 诊断入口读取运行时与系统状态，不需要解锁主密码。
+- 会话正常退出时会尝试停止本工具箱拥有的进程并保存加密配置。强制断电、强制终止或拔盘可能中断保存；不要把“无残留”或“强拔后完整清除”当作保证。
+- 项目原创代码按 [MIT 许可证](LICENSE) 发布，不替代第三方程序各自的许可证。首次准备优先从官方来源获取依赖；若使用镜像，仍须通过官方固定 SHA-256 校验，文件大小不能代替哈希校验。许可和公开附件边界见[第三方许可与公开发布说明](docs/第三方许可与公开发布.md)。
 
-- `config/`、供应商配置、API Key、密码、保险箱及恢复包。
-- `sessions/`、`logs/`、`cache/`、`workspace/` 与工作目录记录。
-- `runtime/`、`npm-global/`、`tools/` 中下载的依赖、编译产物和机器相关状态。
-- 历史备份、测试运行输出、数据库、临时 fixture 和本机诊断脚本。
+## 项目内容
 
-请勿使用 `git add -f` 绕过数据边界。私有仓库也不应存储真实密钥。仓库里的 synthetic/example 测试数据仅用于回归测试。
+- `scripts/`：Windows 与 Linux 启动、运行时准备、会话隔离和测试代码。
+- `harness/registry.json`：不含密钥的工具适配定义。
+- `docs/`：用户步骤、版本说明和实现文档。
+- `AI.cmd`、`AI.sh`：日常入口；`AI设置.cmd`、`AI设置.sh`：设置入口；`AI诊断.cmd`、`AI诊断.sh`：诊断入口。
 
-## 验证示例
-
-基础运行时准备完成后，可按改动范围运行对应测试，例如：
-
-```powershell
-.\runtime\node\node.exe scripts\test-cc-switch-portable-claude-install.cjs
-.\runtime\node\node.exe scripts\test-cc-switch-verify-claude-save.cjs
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-cc-switch-harness-runtime.ps1
-```
-
-部分集成测试需要 Windows 隔离能力、相应运行时或编译工具链。第三方软件从各自官方渠道获取，其许可证由各项目提供。
-
-Linux 的程序包准备入口为 `bash scripts/bootstrap-linux.sh /目标盘路径`，只需在准备程序包时联网；已经备好依赖的 U 盘在下一台电脑上直接启动。准备脚本与日常启动的系统要求不同，详见 Linux 使用说明。加密格式互操作和入口测试可使用 `node scripts/test-linux-encrypted-store.cjs`、`node scripts/test-linux-launch.cjs`；真实隔离测试还需要 Linux 运行时及允许普通用户创建命名空间的内核。
-
-打包脚本增加 `-IncludeLinux`，按经过校验的程序包清单组装 Windows/Linux x64 同盘包；默认仍生成 Windows 包。两种包均从空配置模板开始，不包含用户的保险箱、供应商、历史会话或恢复文件。
-
-## 预发布便携包
-
-首个完整包的版本说明与使用步骤见 [v0.1.0](docs/Release-v0.1.0.md)。源码仓库仍不存放运行时二进制；打包脚本仅从经过检查的依赖目录和空配置模板组装 Release。
-
-### v0.1.0 启动解锁补丁
-
-首版在另一台电脑直接打开 AI.cmd 时可能提示缺少 secure session locator。Release 页面另附 startup-fix 小补丁，将其中 scripts 文件夹合并到工具箱根目录即可，保留现有配置和密码。修复后，交互启动会引导解锁；已有会话直接复用，非交互启动仍需预先解锁。
-
-### CC Switch 显示 Claude Code 未安装
-
-先区分工具箱中的 Claude Code 是否能启动，以及 CC Switch 是否能显示版本。显示“未安装”也可能是版本命令执行失败，不能仅凭这一提示判断程序包缺失。
-
-在出现问题的电脑上双击 `AI诊断.cmd`。诊断使用盘内程序包和全新的临时隔离环境，检查命令查找、命令入口和实际程序的版本运行；不读取保险箱、供应商或已有会话，不联网安装，不更改本机 PATH。结果保存在盘内 `logs/` 的诊断 JSON 文件中，仅包含阶段、版本、退出码和脱敏状态。诊断通过不代表 CC Switch 的真实界面检测必然通过；仍需结合界面错误判断。
-
-### 密码窗口退出或提示保存中断
-
-启动失败时，独立密码窗口会保留错误提示，按 Enter 后关闭。`AI.cmd` 和 `AI设置.cmd` 使用 Windows 自带 PowerShell 的固定路径，避免命中其他软件提供的同名入口。
-
-若上次保存中断在历史版本指针替换阶段，解锁后会验证最近已提交的配置与历史版本，将原始加密文件完整备份到盘内 `config/cc-switch/recovery-archives/`，再恢复历史指针并整理活动存储。未提交的副本保留在加密备份中，不自动替代当前配置。遇到无法确认的中断状态或认证失败会停止恢复，保留文件供进一步诊断。此备份目录与保险箱一样，不纳入 Git 或 Release。
+首次使用步骤见[docs/首次使用.md](docs/首次使用.md)。

@@ -24,6 +24,8 @@ jobs:
         run: node scripts/test-linux-encrypted-store.cjs
       - name: Operating system routing
         run: node scripts/test-linux-launch.cjs
+      - name: Portable Claude installer
+        run: node scripts/test-cc-switch-portable-claude-install.cjs
       - name: Linux session lifecycle
         if: runner.os == 'Linux'
         run: node scripts/test-linux-session.cjs
@@ -36,6 +38,9 @@ jobs:
       - name: Linux bootstrap authorization workflow
         if: runner.os == 'Linux'
         run: node scripts/test-linux-bootstrap-userns.cjs
+      - name: Linux bootstrap verified downloads
+        if: runner.os == 'Linux'
+        run: node scripts/test-linux-bootstrap-download.cjs
       - name: Linux temporary AppArmor policy lifecycle
         if: runner.os == 'Linux'
         run: node scripts/test-linux-userns-privileged.cjs --allow-policy-test
@@ -52,3 +57,46 @@ jobs:
           if ($null -eq $testExitCode) { throw 'Could not read the Windows IPC test process exit code.' }
           Write-Host "Windows IPC test process exited with code $testExitCode."
           exit $testExitCode
+      - name: Windows source preparation safety checks
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $testProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/test-prepare-windows.ps1') -WorkingDirectory $PWD.Path -NoNewWindow -PassThru -Wait
+          $testProcess.Refresh()
+          $testExitCode = $testProcess.ExitCode
+          if ($null -eq $testExitCode) { throw 'Could not read the Windows source preparation test process exit code.' }
+          Write-Host "Windows source preparation test process exited with code $testExitCode."
+          exit $testExitCode
+      - name: Windows native adapter with Unicode and space paths
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installLines = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if ($LASTEXITCODE -ne 0) { throw 'Visual Studio discovery failed.' }
+          $install = @($installLines | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -First 1)
+          if ($install.Count -ne 1) { throw 'No C++ x64 build environment found.' }
+          $devCmd = Join-Path $install[0] 'Common7/Tools/VsDevCmd.bat'
+          $unicodeLabel = ([char]0x4E2D).ToString() + ([char]0x6587).ToString()
+          $fixtureRoot = Join-Path $env:RUNNER_TEMP ('aistick-build-' + $unicodeLabel + ' path-' + [guid]::NewGuid().ToString('N'))
+          $fixtureScripts = Join-Path $fixtureRoot 'source/scripts'
+          $fixtureTemp = Join-Path $fixtureRoot ($unicodeLabel + ' temp path')
+          $output = Join-Path $fixtureRoot ($unicodeLabel + ' output path')
+          New-Item -ItemType Directory -Path $fixtureScripts,$fixtureTemp -Force | Out-Null
+          foreach ($name in @('build-cc-switch-portable-updater-shim.ps1','cc-switch-portable-updater-shim.cpp','cc-switch-portable-update-noop.cpp')) {
+            Copy-Item -LiteralPath (Join-Path $PWD.Path ('scripts/' + $name)) -Destination (Join-Path $fixtureScripts $name)
+          }
+          $previousTemp = $env:TEMP
+          $previousTmp = $env:TMP
+          try {
+            $env:TEMP = $fixtureTemp
+            $env:TMP = $fixtureTemp
+            & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fixtureScripts 'build-cc-switch-portable-updater-shim.ps1') -OutputDirectory $output -VsDevCmd $devCmd
+            if ($LASTEXITCODE -ne 0) { throw 'Native adapter compilation failed.' }
+          } finally {
+            $env:TEMP = $previousTemp
+            $env:TMP = $previousTmp
+          }
+          $manifest = Get-Content -LiteralPath (Join-Path $output 'cc-switch-portable-updater-shim.manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.architecture -ne 'x64' -or $manifest.runtime -ne 'static-msvc-vcruntime') { throw 'Unexpected native runtime.' }
+          if ($manifest.dllSha256 -ne (Get-FileHash -LiteralPath (Join-Path $output 'cc-switch-portable-updater-shim.dll') -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Compiled adapter hash mismatch.' }

@@ -1198,7 +1198,7 @@ async function upgradeLinux(root) {
 
 async function runCli({ root, mode = 'main' }) {
   if (!fs.existsSync(path.join(root, 'scripts', 'linux-encrypted-store.cjs'))) throw new Error('Linux toolbox modules are incomplete. Run the bootstrap from the USB root and sync the complete source set.');
-  await recoverOrphanSessions(root);
+  if (mode !== 'diagnose') await recoverOrphanSessions(root);
   return menu(root, mode);
 }
 

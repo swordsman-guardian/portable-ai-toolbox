@@ -21,19 +21,37 @@ try {
     $batch=Join-Path $scratch 'build.cmd'
     $content=@"
 @echo off
+chcp 65001 >nul
 cd /d "$scratch"
 if errorlevel 1 exit /b 19
 call "$VsDevCmd" -no_logo -arch=x64
 if errorlevel 1 exit /b 20
+chcp 65001 >nul
 cl.exe /nologo /W4 /WX /EHsc /std:c++17 /MT /LD "$source" /link /OUT:"$temporaryDll" shell32.lib
 if errorlevel 1 exit /b 21
 cl.exe /nologo /W4 /WX /EHsc /std:c++17 /MT "$noopSource" /link /OUT:"$temporaryNoop"
 if errorlevel 1 exit /b 22
 exit /b %errorlevel%
 "@
-    [IO.File]::WriteAllText($batch,$content,[Text.Encoding]::ASCII)
-    & $env:ComSpec /d /c $batch
-    if ($LASTEXITCODE -ne 0) { throw "Portable updater shim build failed with exit code $LASTEXITCODE." }
+    [IO.File]::WriteAllText($batch,$content.Replace("`r`n","`n").Replace("`n","`r`n"),(New-Object Text.UTF8Encoding($false)))
+    $buildProcess=New-Object Diagnostics.Process
+    $buildProcess.StartInfo.FileName=$env:ComSpec
+    $buildProcess.StartInfo.Arguments='/d /s /c ""'+$batch+'""'
+    $buildProcess.StartInfo.WorkingDirectory=$scratch
+    $buildProcess.StartInfo.UseShellExecute=$false
+    $buildProcess.StartInfo.CreateNoWindow=$true
+    $buildProcess.StartInfo.RedirectStandardOutput=$true
+    $buildProcess.StartInfo.RedirectStandardError=$true
+    try {
+        if (-not $buildProcess.Start()) { throw 'Portable updater shim build could not start.' }
+        $buildOutput=$buildProcess.StandardOutput.ReadToEndAsync()
+        $buildError=$buildProcess.StandardError.ReadToEndAsync()
+        $buildProcess.WaitForExit()
+        $buildExit=$buildProcess.ExitCode
+        if ($buildOutput.Result) { Write-Host ([string]$buildOutput.Result).TrimEnd() }
+        if ($buildError.Result) { Write-Host ([string]$buildError.Result).TrimEnd() }
+        if ($buildExit -ne 0) { throw "Portable updater shim build failed with exit code $buildExit." }
+    } finally { $buildProcess.Dispose() }
     $destination=Join-Path $outputFull 'cc-switch-portable-updater-shim.dll'
     $noopDestination=Join-Path $outputFull 'cc-switch-portable-update-noop.exe'
     $manifestPath=Join-Path $outputFull 'cc-switch-portable-updater-shim.manifest.json'

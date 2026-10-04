@@ -3,6 +3,10 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/LICENSE
+!/SECURITY.md
+!/CONTRIBUTING.md
+!/准备Windows.cmd
 !/AI.cmd
 !/AI设置.cmd
 !/AI诊断.cmd
@@ -11,11 +15,18 @@
 /scripts/*
 !/docs/
 /docs/*
+!/docs/首次使用.md
+!/docs/Release-v0.2.0.md
+!/docs/第三方许可与公开发布.md
+!/docs/开源发布核验.md
 !/harness/
 /harness/*
 !/harness/registry.json
 !/scripts/appcontainer-probe.ps1
 !/scripts/bootstrap.ps1
+!/scripts/prepare-windows.ps1
+!/scripts/test-prepare-windows.ps1
+!/scripts/build-public-release.ps1
 !/scripts/build-cc-switch-portable-updater-shim.ps1
 !/scripts/cc-switch-checkpoint.ps1
 !/scripts/cc-switch-claude-launch-files.ps1
@@ -176,6 +187,7 @@
 !/scripts/test-linux-userns.cjs
 !/scripts/test-linux-userns-privileged.cjs
 !/scripts/test-linux-bootstrap-userns.cjs
+!/scripts/test-linux-bootstrap-download.cjs
 !/scripts/test-linux-native-proxy.cjs
 !/scripts/test-linux-portable-integration.cjs
 !/scripts/test-linux-encrypted-store.cjs

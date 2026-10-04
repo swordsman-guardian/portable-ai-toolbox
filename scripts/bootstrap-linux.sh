@@ -89,7 +89,7 @@ UV_VER=0.8.22
 CC_VER=3.20.4
 NODE_FILE="node-v${NODE_VER}-linux-x64.tar.xz"
 download_ranges() {
-  local url=$1 output=$2 total=$3 chunk=4194304 start end index part size
+  local url=$1 output=$2 total=$3 chunk=4194304 start end index part size failed=0
   local parts="$WORK/ranges-$(basename "$output")"
   mkdir -p "$parts"
   local -a jobs=()
@@ -101,46 +101,92 @@ download_ranges() {
       --range "${start}-${end}" "$url" -o "$part" &
     jobs+=("$!")
     if ((${#jobs[@]} == 4)); then
-      for job in "${jobs[@]}"; do wait "$job"; done
+      for job in "${jobs[@]}"; do wait "$job" || failed=1; done
       jobs=()
+      if ((failed)); then
+        rm -rf -- "$parts"
+        return 1
+      fi
     fi
     index=$((index+1))
   done
-  for job in "${jobs[@]}"; do wait "$job"; done
+  for job in "${jobs[@]}"; do wait "$job" || failed=1; done
+  jobs=()
+  if ((failed)); then
+    rm -rf -- "$parts"
+    return 1
+  fi
   : > "$output"
   for ((index=0,start=0; start<total; index++,start+=chunk)); do
     part=$(printf '%s/%05d' "$parts" "$index")
     size=$(stat -c '%s' "$part")
     end=$((start+chunk)); ((end>total)) && end=$total
-    [[ $size -eq $((end-start)) ]] || { echo "Range size mismatch for $url" >&2; exit 1; }
+      [[ $size -eq $((end-start)) ]] || { echo "Range size mismatch for $url" >&2; rm -rf -- "$parts"; rm -f -- "$output"; return 1; }
     cat -- "$part" >> "$output"
   done
-  [[ $(stat -c '%s' "$output") -eq $total ]] || { echo "Downloaded size mismatch for $url" >&2; exit 1; }
+  [[ $(stat -c '%s' "$output") -eq $total ]] || { echo "Downloaded size mismatch for $url" >&2; rm -rf -- "$parts"; rm -f -- "$output"; return 1; }
+  rm -rf -- "$parts"
+}
+download_full_verified() {
+  local url=$1 output=$2 total=$3 sha=$4 timeout=$5 full="$2.full-download"
+  rm -f -- "$full"
+  if safe_curl --fail --location --silent --show-error --retry 1 --retry-all-errors --connect-timeout 15 --max-time "$timeout" "$url" -o "$full" \
+    && [[ $(stat -c '%s' -- "$full") -eq $total ]] \
+    && echo "$sha  $full" | sha256sum --check --status; then
+    mv -f -- "$full" "$output"
+    return 0
+  fi
+  rm -f -- "$full"
+  return 1
+}
+download_verified_asset() {
+  local primary_url=$1 fallback_url=$2 output=$3 total=$4 sha=$5 primary_timeout=${6:-300} fallback_timeout=${7:-300} range_url=${8:-}
+  if download_full_verified "$primary_url" "$output" "$total" "$sha" "$primary_timeout"; then return 0; fi
+  if download_full_verified "$fallback_url" "$output" "$total" "$sha" "$fallback_timeout"; then return 0; fi
+  rm -f -- "$output"
+  if [[ -n $range_url ]]; then
+    if ! download_ranges "$range_url" "$output" "$total"; then
+      echo "Could not download verified release asset from primary or fallback sources." >&2
+      return 1
+    fi
+    if ! echo "$sha  $output" | sha256sum --check --status; then
+      echo "Release asset checksum mismatch: $range_url" >&2
+      rm -f -- "$output"
+      return 1
+    fi
+    return 0
+  fi
+  echo 'Could not download a verified release asset from the primary or fallback source.' >&2
+  return 1
 }
 if [[ $MODE == prepare ]]; then
-safe_curl --fail --location --silent --show-error --retry 4 --retry-all-errors --connect-timeout 20 --max-time 120 "https://nodejs.org/dist/v${NODE_VER}/SHASUMS256.txt" -o "$WORK/node-shasums"
-NODE_SHA=$(awk -v f="$NODE_FILE" '$2 == f || $2 == "*" f {print $1; exit}' "$WORK/node-shasums")
-[[ $NODE_SHA =~ ^[0-9a-f]{64}$ ]] || { echo 'Node official checksum record was missing.' >&2; exit 1; }
-if [[ -f $RT/node-runtime.tar.xz ]] && echo "$NODE_SHA  $RT/node-runtime.tar.xz" | sha256sum --check --status; then
+# This pin was copied from Node.js v22.23.3's official SHASUMS256.txt entry
+# for node-v22.23.3-linux-x64.tar.xz and verified against the downloaded archive.
+NODE_SHA=df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de
+NODE_SIZE=31001304
+if [[ -f $RT/node-runtime.tar.xz && $(stat -c '%s' -- "$RT/node-runtime.tar.xz") -eq $NODE_SIZE ]] \
+  && echo "$NODE_SHA  $RT/node-runtime.tar.xz" | sha256sum --check --status; then
   cp -- "$RT/node-runtime.tar.xz" "$WORK/$NODE_FILE"
 else
-  safe_curl --fail --location --silent --show-error --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 "https://nodejs.org/dist/v${NODE_VER}/${NODE_FILE}" -o "$WORK/$NODE_FILE"
-  echo "$NODE_SHA  $WORK/$NODE_FILE" | sha256sum --check --status || { echo 'Node archive checksum mismatch.' >&2; exit 1; }
+  download_verified_asset \
+    "https://nodejs.org/dist/v${NODE_VER}/${NODE_FILE}" \
+    "https://registry.npmmirror.com/-/binary/node/v${NODE_VER}/${NODE_FILE}" \
+    "$WORK/$NODE_FILE" "$NODE_SIZE" "$NODE_SHA" 300 300
 fi
 mkdir -p "$WORK/node"
 tar -xJf "$WORK/$NODE_FILE" -C "$WORK/node" --strip-components=1
 NODE="$WORK/node/bin/node"; NPM_CLI="$WORK/node/lib/node_modules/npm/bin/npm-cli.js"
 
-UV_API=$(safe_curl --fail --location --silent --show-error --retry 4 --retry-all-errors --connect-timeout 20 --max-time 120 "https://api.github.com/repos/astral-sh/uv/releases/tags/${UV_VER}")
-UV_SHA=$(printf '%s' "$UV_API" | "$NODE" -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>{let a=JSON.parse(s).assets.find(x=>x.name==="uv-x86_64-unknown-linux-gnu.tar.gz");process.stdout.write((a?.digest||"").replace(/^sha256:/,""))})')
-UV_SIZE=$(printf '%s' "$UV_API" | "$NODE" -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>{let a=JSON.parse(s).assets.find(x=>x.name==="uv-x86_64-unknown-linux-gnu.tar.gz");process.stdout.write(String(a?.size||0))})')
-[[ $UV_SHA =~ ^[0-9a-f]{64}$ ]] || { echo 'uv official release metadata has no SHA-256 digest.' >&2; exit 1; }
-[[ $UV_SIZE =~ ^[0-9]+$ && $UV_SIZE -gt 0 ]] || { echo 'uv official release size metadata was invalid.' >&2; exit 1; }
+UV_SHA=741ff1f5742c5a4a25d2f829e8395355e43f7a5ae2ebc6368e9ae2df0efb69cf
+UV_SIZE=21291955
 if [[ -f $RT/uv-runtime.tar.gz ]] && echo "$UV_SHA  $RT/uv-runtime.tar.gz" | sha256sum --check --status; then
   cp -- "$RT/uv-runtime.tar.gz" "$WORK/uv.tar.gz"
 else
-  download_ranges "https://github.com/astral-sh/uv/releases/download/${UV_VER}/uv-x86_64-unknown-linux-gnu.tar.gz" "$WORK/uv.tar.gz" "$UV_SIZE"
-  echo "$UV_SHA  $WORK/uv.tar.gz" | sha256sum --check --status || { echo 'uv archive checksum mismatch.' >&2; exit 1; }
+  download_verified_asset \
+    "https://releases.astral.sh/github/uv/releases/download/${UV_VER}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+    "https://github.com/astral-sh/uv/releases/download/${UV_VER}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+    "$WORK/uv.tar.gz" "$UV_SIZE" "$UV_SHA" 300 300 \
+    "https://github.com/astral-sh/uv/releases/download/${UV_VER}/uv-x86_64-unknown-linux-gnu.tar.gz"
 fi
 
 CC_URL="https://github.com/farion1231/cc-switch/releases/download/v${CC_VER}/CC-Switch-v${CC_VER}-Linux-x86_64.AppImage"
@@ -149,8 +195,7 @@ if [[ -f $RT/cc-switch.AppImage ]] && echo "$CC_SHA  $RT/cc-switch.AppImage" | s
   echo 'Using the already verified official CC Switch AppImage.'
   cp -- "$RT/cc-switch.AppImage" "$WORK/cc-switch.AppImage"
 else
-  download_ranges "$CC_URL" "$WORK/cc-switch.AppImage" 93010424
-  echo "$CC_SHA  $WORK/cc-switch.AppImage" | sha256sum --check --status || { echo 'CC Switch official release checksum mismatch.' >&2; exit 1; }
+  download_verified_asset "$CC_URL" "https://gh-proxy.com/${CC_URL}" "$WORK/cc-switch.AppImage" 93010424 "$CC_SHA" 120 300
 fi
 
 # Retrieve Ubuntu's published bubblewrap package without installing it. Package
@@ -315,11 +360,11 @@ PYTHON_FILE='cpython-3.12.11+20250612-x86_64-unknown-linux-gnu-install_only_stri
 PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250612/${PYTHON_FILE/+/%2B}"
 PYTHON_SHA=15a3c9964e485f04d3c92739aca190616e09b2c4fac29b263432f6f29f00c6cf
 PYTHON_SIZE=34395537
+PYTHON_MIRROR_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20250612/${PYTHON_FILE/+/%2B}"
 if [[ -f $TOOLS/python312-runtime.tar.gz ]] && echo "$PYTHON_SHA  $TOOLS/python312-runtime.tar.gz" | sha256sum --check --status; then
   cp -- "$TOOLS/python312-runtime.tar.gz" "$WORK/python312.tar.gz"
 else
-  download_ranges "$PYTHON_URL" "$WORK/python312.tar.gz" "$PYTHON_SIZE"
-  echo "$PYTHON_SHA  $WORK/python312.tar.gz" | sha256sum --check --status || { echo 'Official managed CPython archive checksum mismatch.' >&2; exit 1; }
+  download_verified_asset "$PYTHON_MIRROR_URL" "$PYTHON_URL" "$WORK/python312.tar.gz" "$PYTHON_SIZE" "$PYTHON_SHA" 300 300 "$PYTHON_URL"
   cp -- "$WORK/python312.tar.gz" "$TOOLS/python312-runtime.tar.gz"
 fi
 mkdir -p "$WORK/python"

@@ -545,17 +545,19 @@ async function fetchPackageTarball(meta, name, version, options = {}) {
   let mirrorError;
   const mirrorStartedAt = Date.now();
   const mirrorDeadlineAt = Math.min(deadlineAt, Date.now() + TARBALL_MIRROR_MS);
-  try {
-    const bytes = await requestBuffer(mirrorTarballUrl(name, version), maxBytes, {
-      ...common, deadlineAt: mirrorDeadlineAt, allowedHosts: [MIRROR, MIRROR_CDN], source: 'npmmirror',
-    });
-    try { verifyIntegrity(bytes, meta.dist.integrity, meta.dist.shasum); }
-    catch (error) {
-      error.downloadSource = 'npmmirror'; error.resource = new URL(mirrorTarballUrl(name, version)).pathname;
-      error.bytesReceived = bytes.length; error.contentLength = bytes.length; error.elapsedMs = Date.now() - mirrorStartedAt; throw error;
-    }
-    return bytes;
-  } catch (error) { mirrorError = error; }
+  if (!options.officialOnly) {
+    try {
+      const bytes = await requestBuffer(mirrorTarballUrl(name, version), maxBytes, {
+        ...common, deadlineAt: mirrorDeadlineAt, allowedHosts: [MIRROR, MIRROR_CDN], source: 'npmmirror',
+      });
+      try { verifyIntegrity(bytes, meta.dist.integrity, meta.dist.shasum); }
+      catch (error) {
+        error.downloadSource = 'npmmirror'; error.resource = new URL(mirrorTarballUrl(name, version)).pathname;
+        error.bytesReceived = bytes.length; error.contentLength = bytes.length; error.elapsedMs = Date.now() - mirrorStartedAt; throw error;
+      }
+      return bytes;
+    } catch (error) { mirrorError = error; }
+  }
   try {
     const bytes = await requestBuffer(officialUrl, maxBytes, {
       ...common, allowedHosts: [REGISTRY], source: 'official',
@@ -563,11 +565,13 @@ async function fetchPackageTarball(meta, name, version, options = {}) {
     verifyIntegrity(bytes, meta.dist.integrity, meta.dist.shasum);
     return bytes;
   } catch (officialError) {
-    officialError.mirrorCode = mirrorError && mirrorError.code || 'E_NETWORK';
-    officialError.mirrorBytesReceived = Number.isSafeInteger(mirrorError && mirrorError.bytesReceived) ? mirrorError.bytesReceived : 0;
-    officialError.mirrorContentLength = Number.isSafeInteger(mirrorError && mirrorError.contentLength) ? mirrorError.contentLength : null;
-    officialError.mirrorElapsedMs = Number.isSafeInteger(mirrorError && mirrorError.elapsedMs) ? mirrorError.elapsedMs : 0;
-    officialError.mirrorResource = mirrorError && mirrorError.resource || new URL(mirrorTarballUrl(name, version)).pathname;
+    if (mirrorError) {
+      officialError.mirrorCode = mirrorError.code || 'E_NETWORK';
+      officialError.mirrorBytesReceived = Number.isSafeInteger(mirrorError.bytesReceived) ? mirrorError.bytesReceived : 0;
+      officialError.mirrorContentLength = Number.isSafeInteger(mirrorError.contentLength) ? mirrorError.contentLength : null;
+      officialError.mirrorElapsedMs = Number.isSafeInteger(mirrorError.elapsedMs) ? mirrorError.elapsedMs : 0;
+      officialError.mirrorResource = mirrorError.resource || new URL(mirrorTarballUrl(name, version)).pathname;
+    }
     throw officialError;
   }
 }
@@ -581,7 +585,7 @@ function compareStableVersions(a, b) {
 
 async function downloadAndExtract(meta, name, version, ownedRoot, stageRel, budget) {
   const compressedLimit = Math.min(MAX_TARBALL, budget.compressed);
-  const data = await fetchPackageTarball(meta, name, version, { maxBytes: compressedLimit, deadlineAt: budget.deadlineAt });
+  const data = await fetchPackageTarball(meta, name, version, { maxBytes: compressedLimit, deadlineAt: budget.deadlineAt, officialOnly: !!budget.officialOnly, transport: budget.transport, wait: budget.wait });
   budget.compressed -= data.length;
   verifyIntegrity(data, meta.dist.integrity, meta.dist.shasum);
   const entries = parseTarGzip(data, {
@@ -795,9 +799,118 @@ async function installLocked(args, env, scriptDir, layout) {
   }
 }
 
+function validateInitialRoot(root) {
+  if (typeof root !== 'string' || !path.isAbsolute(root)) fail('E_ROOT', 'preparation root must be an absolute path');
+  const ownedRoot = path.resolve(root);
+  assertPlainTree(ownedRoot, '', { directory: true });
+  const markerRel = '.aistick-open-source-preparation.json';
+  if (!fs.existsSync(path.join(ownedRoot, markerRel))) fail('E_ROOT_MARKER', 'preparation ownership marker is missing');
+  assertPlainTree(ownedRoot, markerRel, { directory: false });
+  let marker;
+  try { marker = JSON.parse(fs.readFileSync(path.join(ownedRoot, markerRel), 'utf8')); }
+  catch { fail('E_ROOT_MARKER', 'preparation ownership marker is invalid'); }
+  if (!marker || marker.schema !== 1 || marker.kind !== 'aistick-windows-preparation' || !['running', 'failed'].includes(marker.state)) {
+    fail('E_ROOT_MARKER', 'preparation ownership marker does not authorize a first installation');
+  }
+  for (const rel of ['runtime', 'runtime/node', 'runtime/updates', 'cache', 'npm-global']) {
+    assertPlainTree(ownedRoot, rel, { directory: true, create: true });
+  }
+  const prefix = path.join(ownedRoot, 'npm-global');
+  const activeRel = 'npm-global/node_modules/@anthropic-ai/claude-code';
+  const shimRel = 'npm-global/claude.cmd';
+  const active = path.join(ownedRoot, activeRel);
+  const shim = path.join(ownedRoot, shimRel);
+  if (fs.existsSync(shim) && !fs.existsSync(active)) fail('E_PREFIX', 'partial Claude installation exists; refusing to overwrite it');
+  if (fs.existsSync(active) && fs.existsSync(shim)) {
+    const top = fs.readdirSync(prefix).sort();
+    if (top.join('|') !== ['claude.cmd', 'node_modules'].join('|')) fail('E_PREFIX', 'npm-global contains unexpected managed-prefix entries');
+    const moduleRoot = path.join(prefix, 'node_modules');
+    const scopeRoot = path.join(moduleRoot, '@anthropic-ai');
+    assertPlainTree(ownedRoot, 'npm-global/node_modules', { directory: true });
+    assertPlainTree(ownedRoot, 'npm-global/node_modules/@anthropic-ai', { directory: true });
+    if (fs.readdirSync(moduleRoot).join('|') !== '@anthropic-ai' || fs.readdirSync(scopeRoot).join('|') !== 'claude-code') {
+      fail('E_PREFIX', 'managed Claude prefix contains unexpected package entries');
+    }
+    assertPlainTree(ownedRoot, activeRel, { directory: true });
+    assertPlainTree(ownedRoot, shimRel, { directory: false });
+    const manifest = readManifest(path.join(active, 'package.json'));
+    verifyPackageTree(ownedRoot, activeRel, manifest.version);
+    if (fs.readFileSync(shim, 'utf8') !== SHIM) fail('E_PREFIX', 'existing Claude command shim is not the expected managed file');
+    return { ownedRoot, prefix, activeRel, shimRel, active, shim, alreadyInstalled: manifest.version };
+  }
+  if (fs.existsSync(active)) {
+    assertPlainTree(ownedRoot, activeRel, { directory: true });
+    if (fs.readdirSync(active).length !== 0) fail('E_PREFIX', 'partial Claude installation exists; refusing to overwrite it');
+    fs.rmdirSync(active);
+  }
+  const scanPrefix = (dir, rel, depth) => {
+    for (const name of fs.readdirSync(dir)) {
+      const allowed = depth === 0 ? name === 'node_modules' : depth === 1 ? name === '@anthropic-ai' : false;
+      if (!allowed) fail('E_PREFIX', 'npm-global contains unexpected data; refusing to overwrite it');
+      const childRel = path.join(rel, name);
+      const child = assertPlainTree(ownedRoot, childRel, { directory: true });
+      scanPrefix(child, childRel, depth + 1);
+    }
+  };
+  scanPrefix(prefix, 'npm-global', 0);
+  assertPlainTree(ownedRoot, 'npm-global/node_modules', { directory: true, create: true });
+  assertPlainTree(ownedRoot, 'npm-global/node_modules/@anthropic-ai', { directory: true, create: true });
+  return { ownedRoot, prefix, activeRel, shimRel, active, shim, alreadyInstalled: null };
+}
+
+async function installInitial(root, options = {}) {
+  const layout = validateInitialRoot(root);
+  if (layout.alreadyInstalled) return { version: layout.alreadyInstalled, alreadyInstalled: true };
+  const { ownedRoot, activeRel, shimRel, active, shim } = layout;
+  const updateId = crypto.randomUUID().replace(/-/g, '');
+  const updateRel = path.join('cache', `claude-initial-${updateId}`);
+  const stageRel = path.join(updateRel, 'stagedClaudePkg');
+  const stagePath = path.join(ownedRoot, stageRel);
+  const archiveBudget = { compressed: MAX_TOTAL_TARBALL, unpacked: MAX_TOTAL_UNPACKED, entries: MAX_TOTAL_ENTRIES, deadlineAt: Date.now() + TARBALL_BUDGET_MS, officialOnly: true, transport: options.transport, wait: options.wait };
+  try {
+    const latest = await fetchJson(`https://${REGISTRY}/@anthropic-ai%2Fclaude-code/latest`, options);
+    if (!latest || latest.name !== PARENT_NAME || !validateSemver(latest.version)) fail('E_METADATA', 'official registry did not return a stable Claude Code release');
+    const parentMeta = validatePackageMetadata(latest, PARENT_NAME, latest.version);
+    const platformVersion = latest.optionalDependencies && latest.optionalDependencies[PLATFORM_NAME];
+    if (platformVersion !== latest.version) fail('E_METADATA', 'official registry metadata does not pin the matching Windows x64 package version');
+    const platformRaw = await fetchJson(`https://${REGISTRY}/@anthropic-ai%2Fclaude-code-win32-x64/${encodeURIComponent(platformVersion)}`, options);
+    const platformMeta = validatePackageMetadata(platformRaw, PLATFORM_NAME, platformVersion);
+    await downloadAndExtract(parentMeta, PARENT_NAME, latest.version, ownedRoot, stageRel, archiveBudget);
+    const platformRel = path.join(stageRel, 'node_modules', '@anthropic-ai', 'claude-code-win32-x64');
+    await downloadAndExtract(platformMeta, PLATFORM_NAME, platformVersion, ownedRoot, platformRel, archiveBudget);
+    verifyPackageTree(ownedRoot, stageRel, latest.version);
+
+    assertPlainTree(ownedRoot, activeRel, { directory: true, create: true });
+    if (fs.readdirSync(active).length !== 0) fail('E_PREFIX', 'Claude destination is not empty');
+    fs.rmdirSync(active);
+    fs.renameSync(stagePath, active);
+    let shimCreated = false;
+    try {
+      verifyPackageTree(ownedRoot, activeRel, latest.version);
+      const shimPath = assertPlainTree(ownedRoot, shimRel, { directory: false, create: true });
+      fs.writeFileSync(shimPath, SHIM, { flag: 'wx' }); shimCreated = true;
+      if (fs.readFileSync(shim, 'utf8') !== SHIM) fail('E_SHIM', 'installed Claude command shim failed verification');
+    } catch (error) {
+      if (shimCreated && fs.existsSync(shim)) fs.unlinkSync(shim);
+      if (fs.existsSync(active)) removeTreeOwned(ownedRoot, activeRel);
+      throw error;
+    }
+    return { version: latest.version, alreadyInstalled: false };
+  } catch (error) {
+    try { if (fs.existsSync(path.join(ownedRoot, updateRel))) removeTreeOwned(ownedRoot, updateRel); } catch {}
+    throw error;
+  }
+}
+
 if (require.main === module) {
-  install(process.argv.slice(2)).then(({ version }) => {
-    process.stdout.write(`Claude Code ${version} installed in portable slot.\n`);
+  const argv = process.argv.slice(2);
+  const run = argv[0] === 'initial'
+    ? (argv.length === 3 && argv[1] === '--root' ? installInitial(argv[2]) : Promise.reject(new InstallError('E_ARGS', 'initial install requires --root <absolute-path>')))
+    : install(argv);
+  run.then(({ version, alreadyInstalled }) => {
+    process.stdout.write(alreadyInstalled
+      ? `Claude Code ${version} is already installed in the managed prefix.\n`
+      : `Claude Code ${version} installed in portable prefix.\n`);
   }).catch(error => {
     const code = error && error.code || 'E_INSTALL';
     process.stderr.write(`${code}: ${error && error.message || 'installation failed'}\n`);
@@ -806,4 +919,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { validateArgs, isSafeSegment, safeTarPath, parseTarGzip, verifyIntegrity, validateLayout, parsePeVersion, assertVersions, extractEntries, validatePackageMetadata, verifyPackageTree, commitCandidate, compareStableVersions, requestBuffer, fetchJson, fetchPackageTarball, install, constants: { ROOT_MARKER, PARENT_NAME, PLATFORM_NAME, REGISTRY, MIRROR, MIRROR_CDN, SHIM, DEADLINE_MS, TARBALL_BUDGET_MS, TARBALL_IDLE_MS, MAX_META, MAX_TARBALL, MAX_GET_RETRIES, GET_RETRY_DELAYS_MS } };
+module.exports = { validateArgs, isSafeSegment, safeTarPath, parseTarGzip, verifyIntegrity, validateLayout, validateInitialRoot, installInitial, parsePeVersion, assertVersions, extractEntries, validatePackageMetadata, verifyPackageTree, commitCandidate, compareStableVersions, requestBuffer, fetchJson, fetchPackageTarball, install, constants: { ROOT_MARKER, PARENT_NAME, PLATFORM_NAME, REGISTRY, MIRROR, MIRROR_CDN, SHIM, DEADLINE_MS, TARBALL_BUDGET_MS, TARBALL_IDLE_MS, MAX_META, MAX_TARBALL, MAX_GET_RETRIES, GET_RETRY_DELAYS_MS } };

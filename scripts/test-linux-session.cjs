@@ -545,6 +545,21 @@ async function run() {
     assert.match(orphanSkipMessage, /不请求密码/,'automatic recovery must skip marked current-boot orphans before password prompts');
     assert.equal(fs.existsSync(blockedOrphan.dir), true);
 
+    fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+    fs.copyFileSync(path.join(__dirname, 'linux-encrypted-store.cjs'), path.join(root, 'scripts', 'linux-encrypted-store.cjs'));
+    const openBeforeDiagnose = fs.openSync, logBeforeDiagnose = console.log;
+    let diagnosticRecoveryReads = 0;
+    fs.openSync = (file, ...args) => {
+      if (String(file) === blockedOwnerFile) { diagnosticRecoveryReads++; throw new Error('Diagnostic must not inspect orphan recovery credentials'); }
+      return openBeforeDiagnose(file, ...args);
+    };
+    console.log = () => {};
+    try {
+      assert.equal(await ui.runCli({ root, mode: 'diagnose' }), 0);
+      assert.equal(diagnosticRecoveryReads, 0, 'diagnostics do not enter credential recovery or request a master password');
+      assert.equal(store.storeStatus(root).currentRevision, unchangedRevision, 'diagnostics do not save configuration');
+    } finally { fs.openSync = openBeforeDiagnose; console.log = logBeforeDiagnose; }
+
     const invalidBootOrphan = await ui.createPrivateSession(root, 'claude'); invalidBootOrphan.opened = store.openStore(root, password);
     invalidBootOrphan.workHash = 'f'.repeat(64); invalidBootOrphan.claudeConfigDir = path.join(invalidBootOrphan.dir, 'harness', 'cc-switch', 'claude');
     ui.writePrivateOwner(invalidBootOrphan);

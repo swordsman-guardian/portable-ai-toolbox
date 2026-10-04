@@ -1,4 +1,10 @@
-Third-party components included in this private MVP distribution
+Third-party components used by the toolbox
+
+The v0.2.0-alpha.1 PUBLIC SOURCE release contains original toolbox source and
+license texts, not the third-party binaries listed below. Preparation downloads
+programs from official sources first, with pinned-hash-verified mirrors where
+supported, for the user's own use. This inventory also
+describes the older private MVP bundle; it is not permission to redistribute it.
 
 All bundled third-party components retain their own licenses and notices.
 This toolbox does not grant rights beyond those supplied by each component.
@@ -21,7 +27,8 @@ Microsoft Edge WebView2 Fixed Version Runtime: bundled component notices
   https://www.microsoft.com/en-us/legal/terms-of-use
 
 The native isolation adapter is toolbox source under scripts/; it is not a modified
-CC Switch executable. Software versions and hashes are recorded in release-manifest.json.
+CC Switch executable. The public source release-manifest.json records source
+file hashes only; preparation records the downloaded dependencies separately.
 
 Optional Linux x86_64 bundle:
 Node and npm notices are retained inside runtime/linux-x64/node-runtime.tar.xz.
