@@ -12,6 +12,7 @@
 若包内包含 AI.sh 和 runtime/linux-x64/，也可以在 Linux 使用同一 U 盘：
 在终端进入解压后的盘根，运行 bash AI设置.sh；选择联网 CC Switch，
 设置或输入同一个主密码，再通过原生窗口配置。日常运行 bash AI.sh。
+Linux 默认工作目录为盘内 workspace，不存在时自动创建；也可以在菜单中选择其他项目目录。
 Linux x86_64 的运行条件、隔离方式和验收范围见 docs/Linux便携使用.md。
 Windows 与 Linux 分开使用程序包，共用盘内加密供应商配置。
 

@@ -41,6 +41,30 @@ async function run() {
     const nestedHomeProject = path.join(os.homedir(), `portable-ai-test-${process.pid}`); fs.mkdirSync(nestedHomeProject, { recursive: true });
     assert.equal(ui.validateWorkDirectory(boundaryRoot, nestedHomeProject), fs.realpathSync(nestedHomeProject));
     fs.rmSync(nestedHomeProject, { recursive: true, force: true });
+    const defaultWork = path.join(boundaryRoot, 'workspace');
+    const unrelatedCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-linux-other-cwd-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(unrelatedCwd);
+      assert.equal(ui.getDefaultWorkDir(boundaryRoot), fs.realpathSync(defaultWork), 'default project directory is anchored at the USB root, regardless of launch directory');
+      const preserved = path.join(defaultWork, 'keep.txt'); fs.writeFileSync(preserved, 'synthetic existing workspace content');
+      assert.equal(ui.getDefaultWorkDir(boundaryRoot), fs.realpathSync(defaultWork));
+      assert.equal(fs.readFileSync(preserved, 'utf8'), 'synthetic existing workspace content', 'opening the default workspace preserves existing files');
+      process.chdir(boundaryRoot);
+      assert.equal(ui.getDefaultWorkDir(boundaryRoot), fs.realpathSync(defaultWork), 'launching from the USB root also selects its workspace');
+      process.chdir(unrelatedCwd);
+      let promptText = '';
+      assert.equal(await ui.getWorkDir(boundaryRoot, async prompt => { promptText = prompt; return ''; }), fs.realpathSync(defaultWork), 'Enter selects the USB workspace');
+      assert.ok(promptText.includes(defaultWork), 'the prompt displays the workspace default');
+      const manualWork = path.join(boundaryRoot, 'manual-project'); fs.mkdirSync(manualWork);
+      assert.equal(await ui.getWorkDir(boundaryRoot, async () => manualWork), fs.realpathSync(manualWork), 'an explicitly entered directory remains supported');
+    } finally { process.chdir(previousCwd); fs.rmSync(unrelatedCwd, { recursive: true, force: true }); }
+    const linkedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-linux-workspace-link-'));
+    const linkedOutside = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-linux-workspace-target-'));
+    try {
+      fs.symlinkSync(linkedOutside, path.join(linkedRoot, 'workspace'), 'dir');
+      assert.throws(() => ui.getDefaultWorkDir(linkedRoot), /symbolic link/i, 'a workspace symlink is rejected before creating or using it');
+    } finally { fs.rmSync(linkedRoot, { recursive: true, force: true }); fs.rmSync(linkedOutside, { recursive: true, force: true }); }
     fs.rmSync(boundaryRoot, { recursive: true, force: true });
     let opened = store.openStore(root, password, { create: true });
     store.saveSnapshot(opened, new Map([['harness/cc-switch/claude/settings.json', Buffer.from('{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}')]]));
@@ -578,6 +602,28 @@ async function testFirstLaunchPty() {
     assert.equal(code, 0, `first-run CLI failed: ${output}`);
     assert.equal(output.includes('synthetic-pty-password'), false, 'masked master password must never appear in terminal output');
     assert.equal(store.storeStatus(fixture).state, 'Absent', 'runtime refusal must happen before a first-run master password can create a vault');
+
+    const launch = spawn('/usr/bin/script', ['-qec', `${quote(process.execPath)} ${quote(path.join(scripts, 'ai.cjs'))}`, '/dev/null'], {
+      cwd: project, env: { PATH: '/usr/bin:/bin', HOME: fixture, TMPDIR: tmp, TERM: 'xterm', LANG: 'C.UTF-8' }, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let launchOutput = '';
+    launch.stdout.on('data', b => { launchOutput += b.toString(); }); launch.stderr.on('data', b => { launchOutput += b.toString(); });
+    const waitLaunchFor = async text => {
+      const deadline = Date.now() + 8000;
+      while (!launchOutput.includes(text)) {
+        if (launch.exitCode !== null) throw new Error(`default-workspace CLI exited before ${text}: ${launchOutput}`);
+        if (Date.now() > deadline) throw new Error(`default-workspace CLI did not show ${text}: ${launchOutput}`);
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    };
+    try {
+      await waitLaunchFor('请选择：'); launch.stdin.write('1\n');
+      await waitLaunchFor('portable Linux runtime is incomplete');
+      assert.ok(fs.statSync(path.join(fixture, 'workspace')).isDirectory(), 'menu option 1 creates the USB-root workspace even when launched from another directory');
+      await waitLaunchFor('请选择：'); launch.stdin.write('0\n');
+      const [launchCode] = await Promise.race([once(launch, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('default-workspace CLI did not exit')), 8000))]);
+      assert.equal(launchCode, 0, `default-workspace launch did not return to the menu cleanly: ${launchOutput}`);
+    } finally { if (launch.exitCode === null) { launch.kill('SIGTERM'); await Promise.race([once(launch, 'exit'), new Promise(resolve => setTimeout(resolve, 1000))]); } }
 
     // Keep a real masked-password TTY check, separated from first-run settings
     // so it cannot create a vault merely to exercise the input widget.

@@ -164,9 +164,20 @@ function validateWorkDirectory(root, requested) {
   }
   return workDir;
 }
-async function getWorkDir(root) {
-  let dir = await ask(`工作目录 [${process.cwd()}]: `);
-  if (!dir) dir = process.cwd();
+function getDefaultWorkDir(root) {
+  const usb = fs.realpathSync(root);
+  const workspace = path.join(usb, 'workspace');
+  assertNoLinks(workspace);
+  fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  assertNoLinks(workspace);
+  const realWorkspace = fs.realpathSync(workspace);
+  if (realWorkspace === usb || !isSameOrWithin(realWorkspace, usb)) throw new Error('默认工作目录必须位于 U 盘 workspace 目录内。');
+  return validateWorkDirectory(usb, realWorkspace);
+}
+async function getWorkDir(root, prompt = ask) {
+  const defaultDir = getDefaultWorkDir(root);
+  let dir = await prompt(`工作目录 [${defaultDir}]: `);
+  if (!dir) return defaultDir;
   dir = path.resolve(dir.replace(/^~(?=$|[\\/])/, os.homedir()));
   return validateWorkDirectory(root, dir);
 }
@@ -1079,12 +1090,7 @@ async function menu(root, mode = 'main') {
       if (choice === '0') return 0;
       if (choice === '3' || choice === '9') await showStatus(root);
       else if (choice === '1' || choice === '2') {
-        let workDir;
-        if (choice === '2') workDir = await getWorkDir(root);
-        else {
-          try { workDir = validateWorkDirectory(root, process.cwd()); }
-          catch { console.log('当前目录属于主目录、U 盘根目录或工具箱运行数据；请选择项目目录。'); workDir = await getWorkDir(root); }
-        }
+        const workDir = choice === '2' ? await getWorkDir(root) : getDefaultWorkDir(root);
         await startClaude(root, workDir);
       }
       else if (choice === '4') {
@@ -1196,4 +1202,4 @@ async function runCli({ root, mode = 'main' }) {
   return menu(root, mode);
 }
 
-module.exports = { askSecret, usbIdentity, stillMounted, createPrivateSession, acquireWriterLease, releaseWriterLease, saveAndRemove, startClaude, runCcSwitch, gateSandboxUserns, restoreSessionSnapshot, awaitSandboxReady, waitForChild, showStatus, runCli, installExitHandlers, sessionCount: () => sessions.size, captureClaudeHistory, latestClaudeHistory, restoreLatestClaudeHistory, validateHistoryPayload, localizeCcSwitchSettings, restorePortablePathSettings, validateWorkDirectory, startProviderBroker, stopProviderBroker, getLiveProvider, lockActiveManager, recoverPrivateBundles, restorePrivateBundle, writePrivateOwner, recoverOrphanSession, recoverOrphanSessions, testProvider, scrubClaudeSettings, mountedNoExec, mountedNeedsPrivatePython, pythonEnvironmentLayout, watchForUnplug };
+module.exports = { askSecret, usbIdentity, stillMounted, createPrivateSession, acquireWriterLease, releaseWriterLease, saveAndRemove, startClaude, runCcSwitch, gateSandboxUserns, restoreSessionSnapshot, awaitSandboxReady, waitForChild, showStatus, runCli, installExitHandlers, sessionCount: () => sessions.size, captureClaudeHistory, latestClaudeHistory, restoreLatestClaudeHistory, validateHistoryPayload, localizeCcSwitchSettings, restorePortablePathSettings, validateWorkDirectory, getDefaultWorkDir, getWorkDir, startProviderBroker, stopProviderBroker, getLiveProvider, lockActiveManager, recoverPrivateBundles, restorePrivateBundle, writePrivateOwner, recoverOrphanSession, recoverOrphanSessions, testProvider, scrubClaudeSettings, mountedNoExec, mountedNeedsPrivatePython, pythonEnvironmentLayout, watchForUnplug };

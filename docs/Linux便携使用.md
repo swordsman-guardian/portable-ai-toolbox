@@ -8,6 +8,8 @@ bash AI.sh
 
 `bash AI设置.sh` 打开设置菜单，`bash AI诊断.sh` 查看运行时和配置状态。Linux 的启动入口使用盘内 Node，不依赖电脑上的 Node 或 PowerShell。入口会检查运行系统，Windows 与 Linux 分别使用自己的运行时，不把 Windows 的可执行文件带到 Linux 启动。
 
+Linux 默认在 U 盘的 `workspace` 目录中工作，不受打开启动器时所在目录影响；目录不存在时会自动创建。菜单中的“启动 Claude Code”直接使用这个目录，“选择工作目录并启动 Claude Code”允许输入其他项目目录，直接回车仍使用盘内 `workspace`。已有的项目文件不会被覆盖。
+
 ## 程序包与运行要求
 
 目前 Linux 程序包面向 x86_64、glibc 2.38 或更新版本（例如 Ubuntu 24.04）。需要能运行官方 CC Switch Linux 包的桌面环境，以及可用或经管理员允许的用户命名空间。启动器先用真正要运行的盘内 bwrap 预检，再询问配置主密码。禁止用户命名空间且无法授权的电脑会停止隔离启动，不会自动改为不隔离运行。ARM、Alpine/musl 和较旧的 glibc 尚不属于本包的支持范围。
