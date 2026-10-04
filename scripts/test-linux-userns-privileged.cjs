@@ -78,7 +78,7 @@ async function main() {
     function options() {
       let probes = 0;
       return {
-        parser, isTTY: true, ask: async () => userns.CONSENT_TOKEN,
+        parser, isTTY: true, notice: () => {},
         restriction: () => 1,
         probe: rt => ++probes === 1
           ? { ok: false, kind: 'namespace-permission', status: 1, stderr: 'synthetic initial permission denial for policy lifecycle integration' }

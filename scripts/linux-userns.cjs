@@ -7,7 +7,6 @@ const crypto = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
 const { sandboxExecEnv } = require('./linux-sandbox.cjs');
 
-const CONSENT_TOKEN = 'APPARMOR';
 const AUTHENTICATED = 'PORTABLE_APPARMOR_AUTHENTICATED\n';
 const LOADED = 'PORTABLE_APPARMOR_LOADED\n';
 const READY = 'PORTABLE_APPARMOR_READY\n';
@@ -271,13 +270,8 @@ async function ensureSandboxUserns(runtime, options = {}) {
   runParser(parser, ['-Q', '-K'], profile.text, options.hooks || {});
   const isTTY = options.isTTY ?? Boolean(process.stdin.isTTY && process.stderr.isTTY);
   if (!isTTY) throw new Error(`AppArmor userns access needs one-time authorization in a TTY. Manual profile load command:\n${manualLoad(profile, parser)}Manual unload command (use the same profile text):\n${manualUnload(profile, parser)}`);
-  const ask = options.ask || (async prompt => new Promise(resolve => {
-    const readline = require('node:readline');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-    rl.question(prompt, answer => { rl.close(); resolve(answer); });
-  }));
-  const answer = await ask(`AppArmor 阻止了本次 user namespace。临时规则只作用于当前会话使用的这一个 bubblewrap 文件；sudo 会在本地终端请求管理员密码。输入 ${CONSENT_TOKEN} 允许，其他输入取消：`);
-  if (answer !== CONSENT_TOKEN) throw new Error('AppArmor authorization was declined; sandbox startup stopped.');
+  const notice = options.notice || (message => process.stderr.write(`${message}\n`));
+  notice('系统限制隔离启动，接下来会请求本机管理员密码（不是 U 盘主密码），为当前会话临时授权；退出时自动撤销，按 Ctrl+C 可取消。');
   const child = sudoCommand(profile, rt, parser, options.hooks || {});
   let stdout = ''; let stderr = '';
   child.stdout?.on('data', chunk => { stdout = (stdout + chunk.toString()).slice(-256); });
@@ -397,7 +391,7 @@ async function guardCommand(runtime, command, args) {
   process.exitCode = code;
 }
 
-module.exports = { CONSENT_TOKEN, AUTHENTICATED, LOADED, READY, UNLOADED, CLEANUP_UNCONFIRMED_MARKER, STATIC_HELPER, parserPath, usernsRestriction, usernsGlobalBlock, sandboxProfileText, manualLoad, manualUnload, writeCleanupUnconfirmedMarker, clearCleanupUnconfirmedMarker, probeUserns, ensureSandboxUserns, releaseSandboxUserns };
+module.exports = { AUTHENTICATED, LOADED, READY, UNLOADED, CLEANUP_UNCONFIRMED_MARKER, STATIC_HELPER, parserPath, usernsRestriction, usernsGlobalBlock, sandboxProfileText, manualLoad, manualUnload, writeCleanupUnconfirmedMarker, clearCleanupUnconfirmedMarker, probeUserns, ensureSandboxUserns, releaseSandboxUserns };
 
 if (require.main === module && process.argv[2] === '--guard-command') {
   let i = 3;
